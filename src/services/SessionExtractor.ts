@@ -1,6 +1,6 @@
 import { Effect, Layer, ServiceMap } from "effect";
 import { type ConversationTurn, type ExtractedConversation } from "../domain/Session";
-import { ParseError } from "../errors/AppError";
+import { DbError, ParseError, SessionNotFoundError } from "../errors/AppError";
 import { SessionStore } from "./SessionStore";
 
 type MessageData = {
@@ -12,17 +12,23 @@ type PartData = {
   readonly text?: string;
 };
 
+export type SessionExtractorError = DbError | ParseError | SessionNotFoundError;
+
 export class SessionExtractor extends ServiceMap.Service<
   SessionExtractor,
   {
-    extract(sessionId: string): Effect.Effect<ExtractedConversation, ParseError | any>;
+    extract(sessionId: string): Effect.Effect<ExtractedConversation, SessionExtractorError>;
   }
 >()("session-article/SessionExtractor") {
   static readonly layer = Layer.effect(SessionExtractor)(
     Effect.gen(function* () {
       const store = yield* SessionStore;
 
-      const extract = Effect.fn("SessionExtractor.extract")(function* (sessionId: string) {
+      const extract: (
+        sessionId: string,
+      ) => Effect.Effect<ExtractedConversation, SessionExtractorError> = Effect.fn(
+        "SessionExtractor.extract",
+      )(function* (sessionId: string) {
         const session = yield* store.getSessionById(sessionId);
         const messages = yield* store.getMessageRows(sessionId);
         const parts = yield* store.getPartRows(sessionId);
