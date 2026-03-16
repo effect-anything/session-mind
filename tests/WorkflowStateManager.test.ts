@@ -1,79 +1,95 @@
-import { describe, expect, it } from "@effect/vitest";
-import { NodeFileSystem, NodePath } from "@effect/platform-node";
-import { Effect, Exit, FileSystem, Layer, Option, Path } from "effect";
-import { WorkflowStateManager, WORKFLOW_MAX_RETRIES } from "../src/services/WorkflowStateManager";
+import { describe, expect, layer } from "@effect/vitest";
+import { Effect, Exit, Option } from "effect";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach } from "vitest";
+import { WorkflowStateManager } from "../src/services/WorkflowStateManager";
 
-const withTempWorkflowRoot = <A, E>(
-  f: (rootDirectory: string) => Effect.Effect<A, E, WorkflowStateManager | FileSystem.FileSystem | Path.Path>,
-) =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const rootDirectory = yield* fs.makeTempDirectory({
-      prefix: "session-mind-workflow-state-",
-    });
+const tempDirectories: Array<string> = [];
 
-    return yield* f(rootDirectory).pipe(
-      Effect.provide(WorkflowStateManager.layerAt({ rootDirectory }), { local: true }),
-      Effect.ensuring(
-        fs.remove(rootDirectory, { recursive: true, force: true }).pipe(Effect.orDie),
-      ),
-    );
-  }).pipe(
-    Effect.provide(Layer.mergeAll(NodeFileSystem.layer, NodePath.layer), { local: true }),
+const createTempDirectory = async () => {
+  const directory = await mkdtemp(join(tmpdir(), "session-mind-workflow-state-"));
+  tempDirectories.push(directory);
+  return directory;
+};
+
+afterEach(async () => {
+  await Promise.all(
+    tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
   );
+});
 
 describe("WorkflowStateManager", () => {
-  it.effect("persists workflow transitions atomically to the state file", () =>
-    withTempWorkflowRoot((rootDirectory) =>
-      Effect.gen(function* () {
+  layer(WorkflowStateManager.layer)((it) => {
+    it.effect(
+      "persists workflow transitions atomically to the state file",
+      Effect.fn(function* () {
         const manager = yield* WorkflowStateManager;
-        const fs = yield* FileSystem.FileSystem;
+        const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
+        const stateFilePath = join(rootDirectory, "state.json");
+        const artifactPath = join(rootDirectory, "artifact.md");
 
-        yield* manager.startWorkflow("session-1", "Extract");
-        yield* manager.transition("session-1", "generating", {
-          currentStep: "Generate prompt bundle",
-        });
-        yield* manager.transition("session-1", "executing", {
-          currentStep: "Run writing agent",
-          artifacts: {
-            promptBundle: ".output/session-mind/sessions/session-1/prompt-bundle.json",
-          },
-        });
-        yield* manager.transition("session-1", "validating", {
-          currentStep: "Validate generated article",
-          artifacts: {
-            generatedArticle: ".output/session-mind/sessions/session-1/output/session-1.md",
-          },
-        });
-        const completeState = yield* manager.transition("session-1", "complete", {
-          currentStep: "Workflow complete",
+        yield* manager.initializeSession({
+          stateFilePath,
+          sessionId: "session-1",
+          artifactPath,
         });
 
-        expect(completeState.status).toBe("complete");
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-1",
+          nextStage: "generating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-1",
+          nextStage: "executing",
+          promptBundlePath: join(rootDirectory, "prompt.json"),
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-1",
+          nextStage: "validating",
+        });
+
+        const completeState = yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-1",
+          nextStage: "complete",
+        });
+
+        expect(completeState.stage).toBe("complete");
         expect(completeState.retryCount).toBe(0);
-        expect(completeState.completedAt).toBeTypeOf("number");
 
-        const stateFilePath = manager.getStateFilePath();
-        const stateFileContent = yield* fs.readFileString(stateFilePath);
-
-        expect(stateFilePath).toContain(
-          `${rootDirectory}/.output/session-mind/state.json`,
-        );
-        expect(stateFileContent).toContain("\"version\": 1");
-        expect(stateFileContent).toContain("\"status\": \"complete\"");
+        const stateFileContent = yield* Effect.tryPromise(() => readFile(stateFilePath, "utf8"));
+        expect(stateFileContent).toContain('"version": 1');
+        expect(stateFileContent).toContain('"stage": "complete"');
         expect(stateFileContent).not.toContain(".tmp");
       }),
-    ));
+    );
 
-  it.effect("rejects invalid workflow transitions", () =>
-    withTempWorkflowRoot(() =>
-      Effect.gen(function* () {
+    it.effect(
+      "rejects invalid workflow transitions",
+      Effect.fn(function* () {
         const manager = yield* WorkflowStateManager;
+        const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
+        const stateFilePath = join(rootDirectory, "state.json");
+        const artifactPath = join(rootDirectory, "artifact.md");
 
-        yield* manager.startWorkflow("session-2", "Extract");
+        yield* manager.initializeSession({
+          stateFilePath,
+          sessionId: "session-2",
+          artifactPath,
+        });
+
         const exit = yield* Effect.exit(
-          manager.transition("session-2", "validating", {
-            currentStep: "Validate before execution",
+          manager.transition({
+            stateFilePath,
+            sessionId: "session-2",
+            nextStage: "validating",
           }),
         );
 
@@ -83,103 +99,40 @@ describe("WorkflowStateManager", () => {
           expect(Option.isSome(failure)).toBe(true);
           if (Option.isSome(failure)) {
             expect(failure.value._tag).toBe("StateError");
-            expect(failure.value.code).toBe("invalid-transition");
-            expect(failure.value.currentStatus).toBe("extracting");
-            expect(failure.value.nextStatus).toBe("validating");
+            expect(failure.value.code).toBe("STATE_TRANSITION_INVALID");
           }
         }
       }),
-    ));
+    );
 
-  it.effect("recovers resumable workflows from persisted state", () =>
-    withTempWorkflowRoot((rootDirectory) =>
-      Effect.gen(function* () {
+    it.effect(
+      "recovers resumable workflows from persisted state",
+      Effect.fn(function* () {
         const manager = yield* WorkflowStateManager;
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const generatedArticlePath = path.join(
-          rootDirectory,
-          ".output",
-          "session-mind",
-          "sessions",
-          "session-3",
-          "output",
-          "session-3.md",
-        );
+        const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
+        const stateFilePath = join(rootDirectory, "state.json");
+        const artifactPath = join(rootDirectory, "artifact.md");
 
-        yield* fs.makeDirectory(path.dirname(generatedArticlePath), { recursive: true });
-        yield* fs.writeFileString(generatedArticlePath, "# article");
-
-        yield* manager.startWorkflow("session-3", "Extract");
-        yield* manager.transition("session-3", "generating", {
-          currentStep: "Generate prompt bundle",
-        });
-        yield* manager.transition("session-3", "executing", {
-          currentStep: "Run writing agent",
-          artifacts: {
-            generatedArticle: generatedArticlePath,
-          },
+        yield* manager.initializeSession({
+          stateFilePath,
+          sessionId: "session-3",
+          artifactPath,
         });
 
-        yield* manager.startWorkflow("session-4", "Extract");
-        yield* manager.transition("session-4", "generating", {
-          currentStep: "Generate prompt bundle",
-        });
-        yield* manager.transition("session-4", "executing", {
-          currentStep: "Run writing agent",
-        });
-        yield* manager.transition("session-4", "validating", {
-          currentStep: "Validate article",
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-3",
+          nextStage: "generating",
         });
 
-        const recoveries = yield* manager.recoverWorkflows();
-        const recoveryBySessionId = new Map(
-          recoveries.map((recovery) => [recovery.sessionId, recovery]),
-        );
+        const recovery = yield* manager.recoverSession(stateFilePath, "session-3");
 
-        expect(recoveryBySessionId.get("session-3")?.resumeFromStatus).toBe("validating");
-        expect(recoveryBySessionId.get("session-3")?.action).toBe("resume-validation");
-        expect(recoveryBySessionId.get("session-4")?.resumeFromStatus).toBe("executing");
-        expect(recoveryBySessionId.get("session-4")?.reason).toContain("artifact is missing");
-      }),
-    ));
-
-  it.effect("tracks transient retries and marks the workflow failed when retries are exhausted", () =>
-    withTempWorkflowRoot(() =>
-      Effect.gen(function* () {
-        const manager = yield* WorkflowStateManager;
-
-        yield* manager.startWorkflow("session-5", "Extract");
-        yield* manager.transition("session-5", "generating", {
-          currentStep: "Generate prompt bundle",
-        });
-
-        for (let index = 1; index <= WORKFLOW_MAX_RETRIES; index += 1) {
-          const result = yield* manager.recordTransientFailure("session-5", {
-            code: "temporary-io",
-            message: `Temporary failure ${index}`,
-            details: { attempt: index },
-          });
-
-          expect(result.shouldRetry).toBe(true);
-          expect(result.state.status).toBe("generating");
-          expect(result.state.retryCount).toBe(index);
-        }
-
-        const exhausted = yield* manager.recordTransientFailure("session-5", {
-          code: "temporary-io",
-          message: "Final transient failure",
-        });
-        const persistedState = yield* manager.getState("session-5");
-
-        expect(exhausted.shouldRetry).toBe(false);
-        expect(exhausted.attemptsRemaining).toBe(0);
-        expect(exhausted.state.status).toBe("failed");
-        expect(Option.isSome(persistedState)).toBe(true);
-        if (Option.isSome(persistedState)) {
-          expect(persistedState.value.status).toBe("failed");
-          expect(persistedState.value.error?.message).toBe("Final transient failure");
+        expect(recovery.action).toBe("resume");
+        if (recovery.action === "resume") {
+          expect(recovery.nextStage).toBe("generating");
+          expect(recovery.state.sessionId).toBe("session-3");
         }
       }),
-    ));
+    );
+  });
 });

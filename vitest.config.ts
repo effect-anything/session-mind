@@ -14,5 +14,18 @@ export default defineConfig({
       "**/.jj/**",
       "**/.{idea,git,cache,output,temp}/**",
     ],
+    coverage: {
+      provider: "v8",
+      reporter: ["text"],
+      include: [
+        "src/domain/SessionMindErrors.ts",
+        "src/domain/SubprocessProtocol.ts",
+        "src/services/ArtifactValidator.ts",
+        "src/services/SubprocessSpawner.ts",
+        "src/services/WorkflowStateManager.ts",
+        "src/services/WorkflowSessionExtractor.ts",
+        "src/services/SessionMindWorkflow.ts",
+      ],
+    },
   },
 });

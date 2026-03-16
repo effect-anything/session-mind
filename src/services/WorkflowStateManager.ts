@@ -1,632 +1,401 @@
-import { NodeFileSystem, NodePath } from "@effect/platform-node";
-import { Effect, FileSystem, Layer, Option, Path, Schema, Semaphore, ServiceMap } from "effect";
-import { StateError } from "../errors/AppError";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+import { Effect, Layer, Option, Schema, ServiceMap } from "effect";
+import { StateError } from "../domain/SessionMindErrors";
 
-const WORKFLOW_OUTPUT_DIRECTORY = ".output/session-mind";
-const STATE_FILE_NAME = "state.json";
-const PERSISTED_STATE_VERSION = 1;
-export const WORKFLOW_MAX_RETRIES = 3;
-
-export const WorkflowStatusSchema = Schema.Union([
-  Schema.Literal("extracting"),
-  Schema.Literal("generating"),
-  Schema.Literal("executing"),
-  Schema.Literal("validating"),
-  Schema.Literal("complete"),
-  Schema.Literal("failed"),
+export const WorkflowStageSchema = Schema.Literals([
+  "extracting",
+  "generating",
+  "executing",
+  "validating",
+  "complete",
+  "failed",
 ]);
 
-export type WorkflowStatus = Schema.Schema.Type<typeof WorkflowStatusSchema>;
+export type WorkflowStage = Schema.Schema.Type<typeof WorkflowStageSchema>;
 
-const ActiveWorkflowStatusSchema = Schema.Union([
-  Schema.Literal("extracting"),
-  Schema.Literal("generating"),
-  Schema.Literal("executing"),
-  Schema.Literal("validating"),
-]);
-
-export type ActiveWorkflowStatus = Schema.Schema.Type<typeof ActiveWorkflowStatusSchema>;
-
-export const WorkflowArtifactsSchema = Schema.Struct({
-  extractedSession: Schema.optional(Schema.String),
-  promptBundle: Schema.optional(Schema.String),
-  generatedArticle: Schema.optional(Schema.String),
-});
-
-export type WorkflowArtifacts = Schema.Schema.Type<typeof WorkflowArtifactsSchema>;
-
-export const WorkflowFailureSchema = Schema.Struct({
-  code: Schema.String,
-  message: Schema.String,
-  retryable: Schema.Boolean,
-  recordedAt: Schema.Number,
-  details: Schema.optional(Schema.Json),
-});
-
-export type WorkflowFailure = Schema.Schema.Type<typeof WorkflowFailureSchema>;
-
-export const WorkflowStateSchema = Schema.Struct({
-  sessionId: Schema.String,
-  status: WorkflowStatusSchema,
-  currentStep: Schema.String,
-  startedAt: Schema.Number,
-  updatedAt: Schema.Number,
-  completedAt: Schema.optional(Schema.Number),
-  retryCount: Schema.Number,
-  error: Schema.optional(WorkflowFailureSchema),
-  artifacts: WorkflowArtifactsSchema,
-});
-
-export type WorkflowState = Schema.Schema.Type<typeof WorkflowStateSchema>;
-
-const PersistedWorkflowStateSchema = Schema.Struct({
-  version: Schema.Literal(PERSISTED_STATE_VERSION),
-  updatedAt: Schema.Number,
-  sessions: Schema.Array(WorkflowStateSchema),
-});
-
-type PersistedWorkflowState = Schema.Schema.Type<typeof PersistedWorkflowStateSchema>;
-
-export const WorkflowRecoveryActionSchema = Schema.Union([
-  Schema.Literal("resume"),
-  Schema.Literal("resume-validation"),
-]);
-
-export type WorkflowRecoveryAction = Schema.Schema.Type<typeof WorkflowRecoveryActionSchema>;
-
-export const WorkflowRecoverySchema = Schema.Struct({
-  sessionId: Schema.String,
-  previousStatus: WorkflowStatusSchema,
-  resumeFromStatus: ActiveWorkflowStatusSchema,
-  action: WorkflowRecoveryActionSchema,
-  reason: Schema.String,
-  retryCount: Schema.Number,
-  state: WorkflowStateSchema,
-});
-
-export type WorkflowRecovery = Schema.Schema.Type<typeof WorkflowRecoverySchema>;
-
-export type WorkflowTransitionOptions = {
-  readonly currentStep?: string;
-  readonly artifacts?: Partial<WorkflowArtifacts>;
-  readonly completedAt?: number;
-  readonly error?: WorkflowFailure;
-};
-
-export type WorkflowRetryResult = {
-  readonly shouldRetry: boolean;
-  readonly attemptsRemaining: number;
-  readonly state: WorkflowState;
-};
-
-export type WorkflowStateManagerOptions = {
-  readonly rootDirectory: string;
-};
-
-const decodePersistedState = Schema.decodeUnknownEffect(PersistedWorkflowStateSchema);
-
-const ACTIVE_WORKFLOW_STATUSES = new Set<WorkflowStatus>([
+export const ActiveWorkflowStageSchema = Schema.Literals([
   "extracting",
   "generating",
   "executing",
   "validating",
 ]);
 
-const ALLOWED_TRANSITIONS: Readonly<Record<WorkflowStatus, ReadonlySet<WorkflowStatus>>> = {
-  extracting: new Set(["extracting", "generating", "failed"]),
-  generating: new Set(["generating", "executing", "failed"]),
-  executing: new Set(["executing", "validating", "failed"]),
-  validating: new Set(["validating", "complete", "failed"]),
-  complete: new Set(["complete"]),
-  failed: new Set(["failed", "extracting"]),
-};
+export type ActiveWorkflowStage = Schema.Schema.Type<typeof ActiveWorkflowStageSchema>;
 
-const emptyPersistedState = (now: number): PersistedWorkflowState => ({
-  version: PERSISTED_STATE_VERSION,
-  updatedAt: now,
-  sessions: [],
+export const SessionWorkflowStateSchema = Schema.Struct({
+  sessionId: Schema.String,
+  stage: WorkflowStageSchema,
+  artifactPath: Schema.String,
+  promptBundlePath: Schema.optional(Schema.String),
+  updatedAt: Schema.Number,
+  retryCount: Schema.Number,
+  lastStableStage: Schema.optional(ActiveWorkflowStageSchema),
+  lastError: Schema.optional(Schema.String),
 });
 
-const sortStates = (states: ReadonlyArray<WorkflowState>) =>
-  [...states].sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+export type SessionWorkflowState = Schema.Schema.Type<typeof SessionWorkflowStateSchema>;
 
-const isActiveWorkflowStatus = (status: WorkflowStatus): status is ActiveWorkflowStatus =>
-  status !== "complete" && status !== "failed";
+export const WorkflowStateSchema = Schema.Struct({
+  version: Schema.Number,
+  sessions: Schema.Record(Schema.String, SessionWorkflowStateSchema),
+});
 
-const normalizePath = (pathService: Path.Path, rootDirectory: string, targetPath: string) =>
-  pathService.isAbsolute(targetPath) ? targetPath : pathService.resolve(rootDirectory, targetPath);
+export type WorkflowState = Schema.Schema.Type<typeof WorkflowStateSchema>;
 
-const withStateError = (
-  code: string,
-  message: string,
-  context?: {
-    readonly sessionId?: string;
-    readonly path?: string;
-    readonly currentStatus?: string;
-    readonly nextStatus?: string;
-  },
-) =>
-  new StateError({
-    code,
-    message,
-    ...(context?.sessionId ? { sessionId: context.sessionId } : {}),
-    ...(context?.path ? { path: context.path } : {}),
-    ...(context?.currentStatus ? { currentStatus: context.currentStatus } : {}),
-    ...(context?.nextStatus ? { nextStatus: context.nextStatus } : {}),
-  });
+export type WorkflowRecovery =
+  | { readonly action: "start" }
+  | {
+      readonly action: "resume";
+      readonly nextStage: ActiveWorkflowStage;
+      readonly state: SessionWorkflowState;
+    }
+  | {
+      readonly action: "complete";
+      readonly state: SessionWorkflowState;
+    };
 
-const makeFailure = (failure: {
-  readonly code: string;
+export type InitializeSessionRequest = {
+  readonly stateFilePath: string;
+  readonly sessionId: string;
+  readonly artifactPath: string;
+};
+
+export type TransitionWorkflowRequest = {
+  readonly stateFilePath: string;
+  readonly sessionId: string;
+  readonly nextStage: WorkflowStage;
+  readonly artifactPath?: string;
+  readonly promptBundlePath?: string;
+};
+
+export type MarkWorkflowFailureRequest = {
+  readonly stateFilePath: string;
+  readonly sessionId: string;
   readonly message: string;
-  readonly retryable: boolean;
-  readonly details?: Schema.Json | undefined;
-}): WorkflowFailure => ({
-  code: failure.code,
-  message: failure.message,
-  retryable: failure.retryable,
-  recordedAt: Date.now(),
-  ...(failure.details === undefined ? {} : { details: failure.details }),
+};
+
+const decodeWorkflowState = Schema.decodeUnknownEffect(WorkflowStateSchema);
+
+const createEmptyState = (): WorkflowState => ({
+  version: 1,
+  sessions: {},
 });
 
-const nextTransitionState = (
-  state: WorkflowState,
-  status: WorkflowStatus,
-  options?: WorkflowTransitionOptions,
-): WorkflowState => {
-  const now = Date.now();
-  const changedStatus = state.status !== status;
+const allowedTransitions: Readonly<Record<WorkflowStage, ReadonlyArray<WorkflowStage>>> = {
+  extracting: ["generating", "failed"],
+  generating: ["executing", "failed"],
+  executing: ["validating", "failed"],
+  validating: ["complete", "failed"],
+  complete: [],
+  failed: ["extracting", "generating", "executing", "validating"],
+};
 
-  return {
-    ...state,
-    status,
-    currentStep: options?.currentStep ?? state.currentStep,
-    updatedAt: now,
-    completedAt: status === "complete" || status === "failed" ? (options?.completedAt ?? now) : undefined,
-    retryCount: changedStatus ? 0 : state.retryCount,
-    error: status === "failed" ? options?.error : (changedStatus ? undefined : (options?.error ?? state.error)),
-    artifacts: {
-      ...state.artifacts,
-      ...options?.artifacts,
+const isActiveStage = (stage: WorkflowStage): stage is ActiveWorkflowStage =>
+  stage === "extracting" ||
+  stage === "generating" ||
+  stage === "executing" ||
+  stage === "validating";
+
+const defaultNextStageForFailure = (state: SessionWorkflowState): ActiveWorkflowStage =>
+  state.lastStableStage ?? "extracting";
+
+const readStateFile = (stateFilePath: string): Effect.Effect<WorkflowState, StateError> =>
+  Effect.tryPromise({
+    try: async () => {
+      const content = await readFile(stateFilePath, "utf8");
+      return JSON.parse(content) as unknown;
     },
-  };
-};
+    catch: (cause) => {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      return new StateError({
+        code: message.includes("ENOENT") ? "STATE_READ_FAILED" : "STATE_CORRUPTED",
+        message: message.includes("ENOENT")
+          ? "Workflow state file does not exist"
+          : "Workflow state file is corrupted",
+        context: {
+          stateFilePath,
+          details: { cause: message },
+        },
+      });
+    },
+  }).pipe(
+    Effect.flatMap((raw) =>
+      decodeWorkflowState(raw).pipe(
+        Effect.mapError(
+          (cause) =>
+            new StateError({
+              code: "STATE_CORRUPTED",
+              message: "Workflow state file could not be decoded",
+              context: {
+                stateFilePath,
+                details: { cause: String(cause) },
+              },
+            }),
+        ),
+      ),
+    ),
+  );
 
-const replaceState = (
-  states: ReadonlyArray<WorkflowState>,
-  nextState: WorkflowState,
-): ReadonlyArray<WorkflowState> => {
-  const nextStates = [...states];
-  const index = nextStates.findIndex((state) => state.sessionId === nextState.sessionId);
-
-  if (index === -1) {
-    nextStates.push(nextState);
-  } else {
-    nextStates[index] = nextState;
-  }
-
-  return sortStates(nextStates);
-};
-
-const removeState = (states: ReadonlyArray<WorkflowState>, sessionId: string): ReadonlyArray<WorkflowState> =>
-  sortStates(states.filter((state) => state.sessionId !== sessionId));
+const persistStateFile = (
+  stateFilePath: string,
+  state: WorkflowState,
+): Effect.Effect<void, StateError> =>
+  Effect.tryPromise({
+    try: async () => {
+      await mkdir(dirname(stateFilePath), { recursive: true });
+      const tempPath = `${stateFilePath}.tmp`;
+      await writeFile(tempPath, JSON.stringify(state, null, 2), "utf8");
+      await rename(tempPath, stateFilePath);
+    },
+    catch: (cause) =>
+      new StateError({
+        code: "STATE_WRITE_FAILED",
+        message: "Failed to persist workflow state",
+        context: {
+          stateFilePath,
+          details: { cause: String(cause) },
+        },
+      }),
+  });
 
 export class WorkflowStateManager extends ServiceMap.Service<
   WorkflowStateManager,
   {
-    readonly startWorkflow: (
+    readState(stateFilePath: string): Effect.Effect<WorkflowState, StateError>;
+    getSessionState(
+      stateFilePath: string,
       sessionId: string,
-      currentStep?: string,
-    ) => Effect.Effect<WorkflowState, StateError>;
-    readonly getState: (
+    ): Effect.Effect<Option.Option<SessionWorkflowState>, StateError>;
+    initializeSession(
+      request: InitializeSessionRequest,
+    ): Effect.Effect<SessionWorkflowState, StateError>;
+    transition(request: TransitionWorkflowRequest): Effect.Effect<SessionWorkflowState, StateError>;
+    markFailure(
+      request: MarkWorkflowFailureRequest,
+    ): Effect.Effect<SessionWorkflowState, StateError>;
+    recoverSession(
+      stateFilePath: string,
       sessionId: string,
-    ) => Effect.Effect<Option.Option<WorkflowState>, StateError>;
-    readonly listStates: () => Effect.Effect<ReadonlyArray<WorkflowState>, StateError>;
-    readonly transition: (
-      sessionId: string,
-      status: WorkflowStatus,
-      options?: WorkflowTransitionOptions,
-    ) => Effect.Effect<WorkflowState, StateError>;
-    readonly updateArtifacts: (
-      sessionId: string,
-      artifacts: Partial<WorkflowArtifacts>,
-    ) => Effect.Effect<WorkflowState, StateError>;
-    readonly markFailed: (
-      sessionId: string,
-      failure: Omit<WorkflowFailure, "recordedAt">,
-    ) => Effect.Effect<WorkflowState, StateError>;
-    readonly recordTransientFailure: (
-      sessionId: string,
-      failure: Omit<WorkflowFailure, "recordedAt" | "retryable">,
-    ) => Effect.Effect<WorkflowRetryResult, StateError>;
-    readonly recoverWorkflows: () => Effect.Effect<ReadonlyArray<WorkflowRecovery>, StateError>;
-    readonly clearWorkflow: (sessionId: string) => Effect.Effect<void, StateError>;
-    readonly getStateFilePath: () => string;
+    ): Effect.Effect<WorkflowRecovery, StateError>;
   }
 >()("session-mind/WorkflowStateManager") {
-  static readonly layer = WorkflowStateManager.layerAt({
-    rootDirectory: process.cwd(),
-  });
-
-  static layerAt(options: WorkflowStateManagerOptions) {
-    return Layer.effect(WorkflowStateManager)(
-      Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const lock = yield* Semaphore.make(1);
-
-        const stateFilePath = path.resolve(
-          options.rootDirectory,
-          WORKFLOW_OUTPUT_DIRECTORY,
-          STATE_FILE_NAME,
+  static readonly layer = Layer.succeed(
+    WorkflowStateManager,
+    (() => {
+      const readState = Effect.fn("WorkflowStateManager.readState")(function* (
+        stateFilePath: string,
+      ) {
+        return yield* readStateFile(stateFilePath).pipe(
+          Effect.catchTag("StateError", (error) =>
+            error.code === "STATE_READ_FAILED"
+              ? Effect.succeed(createEmptyState())
+              : Effect.fail(error),
+          ),
         );
-        const stateDirectory = path.dirname(stateFilePath);
+      });
 
-        const readStore = Effect.fn("WorkflowStateManager.readStore")(function* () {
-          const exists = yield* fs.exists(stateFilePath).pipe(
-            Effect.mapError((cause) =>
-              withStateError("state-read-failed", String(cause), { path: stateFilePath }),
-            ),
-          );
+      const getSessionState = Effect.fn("WorkflowStateManager.getSessionState")(function* (
+        stateFilePath: string,
+        sessionId: string,
+      ) {
+        const state = yield* readState(stateFilePath);
+        const sessionState = state.sessions[sessionId];
+        return sessionState === undefined ? Option.none() : Option.some(sessionState);
+      });
 
-          if (!exists) {
-            return emptyPersistedState(Date.now());
-          }
+      const initializeSession = Effect.fn("WorkflowStateManager.initializeSession")(function* ({
+        stateFilePath,
+        sessionId,
+        artifactPath,
+      }: InitializeSessionRequest) {
+        const state = yield* readState(stateFilePath);
+        const existing = state.sessions[sessionId];
+        if (existing) {
+          return existing;
+        }
 
-          const raw = yield* fs.readFileString(stateFilePath).pipe(
-            Effect.mapError((cause) =>
-              withStateError("state-read-failed", String(cause), { path: stateFilePath }),
-            ),
-          );
-
-          const parsed = yield* Effect.try({
-            try: () => JSON.parse(raw) as unknown,
-            catch: (cause) =>
-              withStateError("state-parse-failed", String(cause), { path: stateFilePath }),
-          });
-
-          return yield* decodePersistedState(parsed).pipe(
-            Effect.mapError((cause) =>
-              withStateError("state-decode-failed", String(cause), { path: stateFilePath }),
-            ),
-          );
-        });
-
-        const writeStore = (store: PersistedWorkflowState) =>
-          Effect.gen(function* () {
-            yield* fs.makeDirectory(stateDirectory, { recursive: true }).pipe(
-              Effect.mapError((cause) =>
-                withStateError("state-write-failed", String(cause), { path: stateDirectory }),
-              ),
-            );
-
-            const tempPath = path.join(
-              stateDirectory,
-              `${STATE_FILE_NAME}.${Math.random().toString(36).slice(2)}.tmp`,
-            );
-            const payload = JSON.stringify(
-              {
-                ...store,
-                sessions: sortStates(store.sessions),
-              },
-              null,
-              2,
-            );
-
-            yield* fs.writeFileString(tempPath, payload).pipe(
-              Effect.mapError((cause) =>
-                withStateError("state-write-failed", String(cause), { path: tempPath }),
-              ),
-            );
-
-            yield* fs.rename(tempPath, stateFilePath).pipe(
-              Effect.mapError((cause) =>
-                withStateError("state-write-failed", String(cause), { path: stateFilePath }),
-              ),
-            );
-          });
-
-        const modifyStore = <A>(
-          f: (store: PersistedWorkflowState) => Effect.Effect<readonly [A, PersistedWorkflowState], StateError>,
-        ) =>
-          lock.withPermit(
-            Effect.gen(function* () {
-              const currentStore = yield* readStore();
-              const [result, nextStore] = yield* f(currentStore);
-              const storeToPersist = {
-                ...nextStore,
-                updatedAt: Date.now(),
-                sessions: sortStates(nextStore.sessions),
-              };
-
-              yield* writeStore(storeToPersist);
-              return result;
-            }),
-          );
-
-        const getRequiredState = (
-          store: PersistedWorkflowState,
-          sessionId: string,
-        ): Effect.Effect<WorkflowState, StateError> => {
-          const state = store.sessions.find((item) => item.sessionId === sessionId);
-          return state
-            ? Effect.succeed(state)
-            : Effect.fail(
-                withStateError("state-not-found", `Workflow state not found for session ${sessionId}`, {
-                  sessionId,
-                  path: stateFilePath,
-                }),
-              );
+        const sessionState: SessionWorkflowState = {
+          sessionId,
+          stage: "extracting",
+          artifactPath,
+          updatedAt: Date.now(),
+          retryCount: 0,
+          lastStableStage: "extracting",
         };
 
-        const startWorkflow = Effect.fn("WorkflowStateManager.startWorkflow")(function* (
-          sessionId: string,
-          currentStep = "Extract session content",
-        ) {
-          return yield* modifyStore((store) => {
-            const existingState = store.sessions.find((state) => state.sessionId === sessionId);
-            const now = Date.now();
-
-            const nextState: WorkflowState = existingState &&
-                existingState.status !== "complete" &&
-                existingState.status !== "failed"
-              ? {
-                  ...existingState,
-                  currentStep,
-                  updatedAt: now,
-                }
-              : {
-                  sessionId,
-                  status: "extracting",
-                  currentStep,
-                  startedAt: now,
-                  updatedAt: now,
-                  retryCount: 0,
-                  artifacts: {},
-                };
-
-            return Effect.succeed([
-              nextState,
-              {
-                ...store,
-                sessions: replaceState(store.sessions, nextState),
-              },
-            ] as const);
-          });
-        });
-
-        const getState = Effect.fn("WorkflowStateManager.getState")(function* (sessionId: string) {
-          const store = yield* readStore();
-          return Option.fromNullishOr(
-            store.sessions.find((state) => state.sessionId === sessionId),
-          );
-        });
-
-        const listStates = Effect.fn("WorkflowStateManager.listStates")(function* () {
-          const store = yield* readStore();
-          return sortStates(store.sessions);
-        });
-
-        const transition = Effect.fn("WorkflowStateManager.transition")(function* (
-          sessionId: string,
-          status: WorkflowStatus,
-          options?: WorkflowTransitionOptions,
-        ) {
-          return yield* modifyStore((store) =>
-            Effect.gen(function* () {
-              const currentState = yield* getRequiredState(store, sessionId);
-              const allowedTransitions = ALLOWED_TRANSITIONS[currentState.status];
-
-              if (!allowedTransitions.has(status)) {
-                return yield* (
-                  withStateError(
-                    "invalid-transition",
-                    `Cannot transition workflow state from ${currentState.status} to ${status}`,
-                    {
-                      sessionId,
-                      path: stateFilePath,
-                      currentStatus: currentState.status,
-                      nextStatus: status,
-                    },
-                  )
-                );
-              }
-
-              const nextState = nextTransitionState(currentState, status, options);
-
-              return [
-                nextState,
-                {
-                  ...store,
-                  sessions: replaceState(store.sessions, nextState),
-                },
-              ] as const;
-            }),
-          );
-        });
-
-        const updateArtifacts = Effect.fn("WorkflowStateManager.updateArtifacts")(function* (
-          sessionId: string,
-          artifacts: Partial<WorkflowArtifacts>,
-        ) {
-          return yield* modifyStore((store) =>
-            Effect.gen(function* () {
-              const currentState = yield* getRequiredState(store, sessionId);
-              const nextState: WorkflowState = {
-                ...currentState,
-                updatedAt: Date.now(),
-                artifacts: {
-                  ...currentState.artifacts,
-                  ...artifacts,
-                },
-              };
-
-              return [
-                nextState,
-                {
-                  ...store,
-                  sessions: replaceState(store.sessions, nextState),
-                },
-              ] as const;
-            }),
-          );
-        });
-
-        const markFailed = Effect.fn("WorkflowStateManager.markFailed")(function* (
-          sessionId: string,
-          failure: Omit<WorkflowFailure, "recordedAt">,
-        ) {
-          return yield* transition(sessionId, "failed", {
-            error: makeFailure(failure),
-            currentStep: failure.message,
-          });
-        });
-
-        const recordTransientFailure = Effect.fn("WorkflowStateManager.recordTransientFailure")(
-          function* (
-            sessionId: string,
-            failure: Omit<WorkflowFailure, "recordedAt" | "retryable">,
-          ) {
-            return yield* modifyStore((store) =>
-              Effect.gen(function* () {
-                const currentState = yield* getRequiredState(store, sessionId);
-                const retryCount = currentState.retryCount + 1;
-                const error = makeFailure({
-                  ...failure,
-                  retryable: true,
-                });
-
-                if (retryCount > WORKFLOW_MAX_RETRIES) {
-                  const failedState = nextTransitionState(currentState, "failed", {
-                    error,
-                    currentStep: `Retry limit exceeded for ${currentState.currentStep}`,
-                  });
-                  const result: WorkflowRetryResult = {
-                    shouldRetry: false,
-                    attemptsRemaining: 0,
-                    state: failedState,
-                  };
-
-                  return [
-                    result,
-                    {
-                      ...store,
-                      sessions: replaceState(store.sessions, failedState),
-                    },
-                  ] as const;
-                }
-
-                const nextState: WorkflowState = {
-                  ...currentState,
-                  updatedAt: Date.now(),
-                  retryCount,
-                  error,
-                };
-                const result: WorkflowRetryResult = {
-                  shouldRetry: true,
-                  attemptsRemaining: WORKFLOW_MAX_RETRIES - retryCount,
-                  state: nextState,
-                };
-
-                return [
-                  result,
-                  {
-                    ...store,
-                    sessions: replaceState(store.sessions, nextState),
-                  },
-                ] as const;
-              }),
-            );
+        const nextState: WorkflowState = {
+          ...state,
+          sessions: {
+            ...state.sessions,
+            [sessionId]: sessionState,
           },
-        );
+        };
 
-        const recoverWorkflows = Effect.fn("WorkflowStateManager.recoverWorkflows")(function* () {
-          const store = yield* readStore();
-          const recoveries = yield* Effect.forEach(
-            store.sessions.filter((state) => ACTIVE_WORKFLOW_STATUSES.has(state.status)),
-            (state) =>
-              Effect.gen(function* () {
-                const generatedArticlePath = state.artifacts.generatedArticle;
-                const generatedArticleExists = generatedArticlePath
-                  ? yield* fs.exists(
-                      normalizePath(path, options.rootDirectory, generatedArticlePath),
-                    ).pipe(
-                      Effect.mapError((cause) =>
-                        withStateError("state-recovery-failed", String(cause), {
-                          sessionId: state.sessionId,
-                          path: generatedArticlePath,
-                        }),
-                      ),
-                    )
-                  : false;
+        yield* persistStateFile(stateFilePath, nextState);
+        return sessionState;
+      });
 
-                if (state.status === "executing" && generatedArticleExists) {
-                  return {
-                    sessionId: state.sessionId,
-                    previousStatus: state.status,
-                    resumeFromStatus: "validating",
-                    action: "resume-validation",
-                    reason: "Generated article already exists, resume validation.",
-                    retryCount: state.retryCount,
-                    state,
-                  } satisfies WorkflowRecovery;
-                }
+      const transition = Effect.fn("WorkflowStateManager.transition")(function* ({
+        stateFilePath,
+        sessionId,
+        nextStage,
+        artifactPath,
+        promptBundlePath,
+      }: TransitionWorkflowRequest) {
+        const state = yield* readState(stateFilePath);
+        const current = state.sessions[sessionId];
 
-                if (state.status === "validating" && !generatedArticleExists) {
-                  return {
-                    sessionId: state.sessionId,
-                    previousStatus: state.status,
-                    resumeFromStatus: "executing",
-                    action: "resume",
-                    reason: "Validation artifact is missing, resume execution to regenerate it.",
-                    retryCount: state.retryCount,
-                    state,
-                  } satisfies WorkflowRecovery;
-                }
+        if (!current) {
+          return yield* new StateError({
+            code: "STATE_TRANSITION_INVALID",
+            message: "Cannot transition a session without state",
+            context: {
+              stateFilePath,
+              sessionId,
+              nextState: nextStage,
+            },
+          });
+        }
 
-                return {
-                  sessionId: state.sessionId,
-                  previousStatus: state.status,
-                  resumeFromStatus: isActiveWorkflowStatus(state.status)
-                    ? state.status
-                    : "extracting",
-                  action: "resume",
-                  reason: "Resume the persisted workflow step.",
-                  retryCount: state.retryCount,
-                  state,
-                } satisfies WorkflowRecovery;
-              }),
-          );
+        if (!allowedTransitions[current.stage].includes(nextStage)) {
+          return yield* new StateError({
+            code: "STATE_TRANSITION_INVALID",
+            message: "Invalid workflow state transition",
+            context: {
+              stateFilePath,
+              sessionId,
+              currentState: current.stage,
+              nextState: nextStage,
+              retryCount: current.retryCount,
+            },
+          });
+        }
 
-          return sortStates(recoveries.map((recovery) => recovery.state)).map((state) =>
-            recoveries.find((recovery) => recovery.sessionId === state.sessionId)!,
-          );
-        });
+        const { lastError: _lastError, ...currentWithoutLastError } = current;
+        const nextSessionState: SessionWorkflowState = {
+          ...currentWithoutLastError,
+          stage: nextStage,
+          artifactPath: artifactPath ?? current.artifactPath,
+          updatedAt: Date.now(),
+          ...(isActiveStage(nextStage)
+            ? { lastStableStage: nextStage }
+            : current.lastStableStage !== undefined
+              ? { lastStableStage: current.lastStableStage }
+              : {}),
+          ...(promptBundlePath !== undefined
+            ? { promptBundlePath }
+            : current.promptBundlePath !== undefined
+              ? { promptBundlePath: current.promptBundlePath }
+              : {}),
+        };
 
-        const clearWorkflow = Effect.fn("WorkflowStateManager.clearWorkflow")(function* (sessionId: string) {
-          yield* modifyStore((store) =>
-            Effect.succeed([
-              undefined,
-              {
-                ...store,
-                sessions: removeState(store.sessions, sessionId),
+        const nextStateObject: WorkflowState = {
+          ...state,
+          sessions: {
+            ...state.sessions,
+            [sessionId]: nextSessionState,
+          },
+        };
+
+        yield* persistStateFile(stateFilePath, nextStateObject);
+        return nextSessionState;
+      });
+
+      const markFailure = Effect.fn("WorkflowStateManager.markFailure")(function* ({
+        stateFilePath,
+        sessionId,
+        message,
+      }: MarkWorkflowFailureRequest) {
+        const state = yield* readState(stateFilePath);
+        const current = state.sessions[sessionId];
+
+        if (!current) {
+          return yield* new StateError({
+            code: "STATE_TRANSITION_INVALID",
+            message: "Cannot fail a session without state",
+            context: {
+              stateFilePath,
+              sessionId,
+              nextState: "failed",
+            },
+          });
+        }
+
+        const failedState: SessionWorkflowState = {
+          ...current,
+          stage: "failed",
+          updatedAt: Date.now(),
+          retryCount: current.retryCount + 1,
+          lastError: message,
+        };
+
+        const nextState: WorkflowState = {
+          ...state,
+          sessions: {
+            ...state.sessions,
+            [sessionId]: failedState,
+          },
+        };
+
+        yield* persistStateFile(stateFilePath, nextState);
+        return failedState;
+      });
+
+      const recoverSession = Effect.fn("WorkflowStateManager.recoverSession")(function* (
+        stateFilePath: string,
+        sessionId: string,
+      ) {
+        const state = yield* readState(stateFilePath);
+        const current = state.sessions[sessionId];
+
+        if (!current) {
+          return { action: "start" } satisfies WorkflowRecovery;
+        }
+
+        if (current.stage === "complete") {
+          return {
+            action: "complete",
+            state: current,
+          } satisfies WorkflowRecovery;
+        }
+
+        if (current.stage === "failed") {
+          if (current.retryCount >= 3) {
+            return yield* new StateError({
+              code: "STATE_RECOVERY_FAILED",
+              message: "Workflow session exceeded maximum recovery attempts",
+              context: {
+                stateFilePath,
+                sessionId,
+                currentState: current.stage,
+                retryCount: current.retryCount,
               },
-            ] as const),
-          );
-        });
+            });
+          }
 
-        return WorkflowStateManager.of({
-          startWorkflow,
-          getState,
-          listStates,
-          transition,
-          updateArtifacts,
-          markFailed,
-          recordTransientFailure,
-          recoverWorkflows,
-          clearWorkflow,
-          getStateFilePath: () => stateFilePath,
-        });
-      }),
-    ).pipe(Layer.provideMerge(NodeFileSystem.layer), Layer.provideMerge(NodePath.layer));
-  }
+          return {
+            action: "resume",
+            nextStage: defaultNextStageForFailure(current),
+            state: current,
+          } satisfies WorkflowRecovery;
+        }
+
+        return {
+          action: "resume",
+          nextStage: current.stage,
+          state: current,
+        } satisfies WorkflowRecovery;
+      });
+
+      return WorkflowStateManager.of({
+        readState,
+        getSessionState,
+        initializeSession,
+        transition,
+        markFailure,
+        recoverSession,
+      });
+    })(),
+  );
 }

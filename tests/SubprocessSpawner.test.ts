@@ -1,0 +1,128 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Effect } from "effect";
+import { afterEach, describe, expect, it } from "vitest";
+import type { ExtractedConversation, PromptBundle } from "../src/domain/Session";
+import {
+  SessionMindEnvironmentVariables,
+  SessionMindOutputPaths,
+} from "../src/domain/SubprocessProtocol";
+import { SubprocessSpawner } from "../src/services/SubprocessSpawner";
+
+const tempDirectories: Array<string> = [];
+
+const createTempDirectory = async (): Promise<string> => {
+  const directory = await mkdtemp(join(tmpdir(), "subprocess-spawner-"));
+  tempDirectories.push(directory);
+  return directory;
+};
+
+const extractedConversation: ExtractedConversation = {
+  session: {
+    id: "session-1",
+    title: "Workflow session",
+    directory: "/workspace",
+    timeCreated: 1,
+    timeUpdated: 2,
+    projectId: "project-1",
+  },
+  turns: [
+    {
+      role: "user",
+      content: "Turn this session into an article.",
+      timestamp: 1,
+      sessionId: "session-1",
+      messageId: "message-1",
+    },
+  ],
+  extractedAt: 3,
+  stats: {
+    totalMessages: 1,
+    totalParts: 1,
+    keptTurns: 1,
+    droppedToolParts: 0,
+    droppedReasoningParts: 0,
+    droppedStepParts: 0,
+    droppedEmptyTextParts: 0,
+  },
+};
+
+const promptBundle: PromptBundle = {
+  topicHint: "Workflow session",
+  prompt: "Write the article.",
+  sourceSessionIds: ["session-1"],
+  generatedAt: 4,
+  extracted: [extractedConversation],
+};
+
+const spawnSubprocess = (directory: string, args: ReadonlyArray<string>, timeoutMs?: number) =>
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const spawner = yield* SubprocessSpawner;
+      return yield* spawner.spawn({
+        command: process.execPath,
+        args,
+        cwd: directory,
+        sessionId: "session-1",
+        promptBundle,
+        outputDir: join(directory, SessionMindOutputPaths.workflowRoot),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      });
+    }).pipe(Effect.provide(SubprocessSpawner.layer)),
+  );
+
+afterEach(async () => {
+  await Promise.all(tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+describe("SubprocessSpawner", () => {
+  it("spawns a subprocess, passes protocol environment variables, and captures success output", async () => {
+    const directory = await createTempDirectory();
+    const script = [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      `const bundle = JSON.parse(process.env.${SessionMindEnvironmentVariables.promptBundle});`,
+      `const outputDir = process.env.${SessionMindEnvironmentVariables.outputDir};`,
+      `const sessionId = process.env.${SessionMindEnvironmentVariables.sessionId};`,
+      "const artifactPath = path.join(outputDir, 'articles', `${sessionId}.md`);",
+      "fs.mkdirSync(path.dirname(artifactPath), { recursive: true });",
+      "fs.writeFileSync(artifactPath, `# ${bundle.topicHint}\\n\\nThis generated article content is intentionally long enough to pass validation.`);",
+      "process.stdout.write(`${sessionId}:${bundle.sourceSessionIds.join(',')}`);",
+    ].join("");
+
+    const result = await spawnSubprocess(directory, ["-e", script], 1_000);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("session-1:session-1");
+    expect(result.artifactPath).toBe(
+      join(directory, SessionMindOutputPaths.workflowRoot, "articles", "session-1.md"),
+    );
+
+    const persistedBundle = JSON.parse(await readFile(result.promptBundlePath, "utf8")) as PromptBundle;
+    expect(persistedBundle.topicHint).toBe("Workflow session");
+  });
+
+  it("returns a typed error when the subprocess exits non-zero", async () => {
+    const directory = await createTempDirectory();
+    const script = "process.stderr.write('boom'); process.exit(3);";
+
+    await expect(spawnSubprocess(directory, ["-e", script], 1_000)).rejects.toMatchObject({
+      _tag: "SubprocessError",
+      code: "SUBPROCESS_EXITED_NON_ZERO",
+      context: expect.objectContaining({
+        exitCode: 3,
+      }),
+    });
+  });
+
+  it("terminates the subprocess when it exceeds the timeout", async () => {
+    const directory = await createTempDirectory();
+    const script = "setTimeout(() => process.exit(0), 5_000);";
+
+    await expect(spawnSubprocess(directory, ["-e", script], 50)).rejects.toMatchObject({
+      _tag: "SubprocessError",
+      code: "SUBPROCESS_TIMED_OUT",
+    });
+  });
+});

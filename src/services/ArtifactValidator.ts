@@ -191,10 +191,7 @@ const parseFence = (line: string): Pick<FenceState, "marker" | "length"> | undef
   };
 };
 
-const makeFileReadIssue = (
-  artifactPath: string,
-  cause: unknown,
-): ArtifactValidationIssue => {
+const makeFileReadIssue = (artifactPath: string, cause: unknown): ArtifactValidationIssue => {
   const code = getNodeErrorCode(cause);
 
   if (code === "ENOENT") {

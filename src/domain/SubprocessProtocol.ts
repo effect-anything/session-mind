@@ -177,3 +177,26 @@ export const resolveSubprocessArtifactPath = (
   outputDir: string,
   sessionId: string,
 ): `${string}/${string}.md` => `${outputDir.replace(/\/+$/, "")}/${sessionId}.md`;
+export const SessionMindEnvironmentVariables = {
+  promptBundle: "SESSION_MIND_PROMPT_BUNDLE",
+  outputDir: "SESSION_MIND_OUTPUT_DIR",
+  sessionId: "SESSION_MIND_SESSION_ID",
+  timeoutSeconds: "SESSION_MIND_TIMEOUT_SECONDS",
+} as const;
+
+export const SessionMindExitCodes = {
+  success: 0,
+  validationFailed: 1,
+  timeout: 2,
+  error: 3,
+} as const;
+
+export type SessionMindExitCode =
+  (typeof SessionMindExitCodes)[keyof typeof SessionMindExitCodes];
+
+export const SessionMindOutputPaths = {
+  workflowRoot: ".output/session-mind",
+  articlesDirectory: "articles",
+  bundlesDirectory: "bundles",
+  stateFile: "state.json",
+} as const;

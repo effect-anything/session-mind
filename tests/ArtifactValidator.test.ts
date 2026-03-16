@@ -1,12 +1,9 @@
 import { describe, expect, layer } from "@effect/vitest";
 import { Effect, Schema } from "effect";
-import { join } from "node:path";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import {
-  ArtifactValidator,
-  defaultArtifactMinimumLength,
-} from "../src/services/ArtifactValidator";
+import { join } from "node:path";
+import { ArtifactValidator, defaultArtifactMinimumLength } from "../src/services/ArtifactValidator";
 
 class TestFileSystemError extends Schema.TaggedErrorClass<TestFileSystemError>()(
   "TestFileSystemError",
