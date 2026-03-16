@@ -19,3 +19,12 @@ export class ParseError extends Schema.TaggedErrorClass<ParseError>()("ParseErro
 export class CliError extends Schema.TaggedErrorClass<CliError>()("CliError", {
   message: Schema.String,
 }) {}
+
+export class StateError extends Schema.TaggedErrorClass<StateError>()("StateError", {
+  code: Schema.String,
+  message: Schema.String,
+  sessionId: Schema.optional(Schema.String),
+  path: Schema.optional(Schema.String),
+  currentStatus: Schema.optional(Schema.String),
+  nextStatus: Schema.optional(Schema.String),
+}) {}
