@@ -1,6 +1,6 @@
 import * as BunServices from "@effect/platform-bun/BunServices";
 import * as BunRuntime from "@effect/platform-bun/BunRuntime";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Schema, SchemaGetter } from "effect";
 import * as Console from "effect/Console";
 import * as Command from "effect/unstable/cli/Command";
 import * as Argument from "effect/unstable/cli/Argument";
@@ -15,6 +15,11 @@ import { SessionMindWorkflow } from "./services/SessionMindWorkflow";
 import { SubprocessSpawner } from "./services/SubprocessSpawner";
 import { WorkflowSessionExtractor } from "./services/WorkflowSessionExtractor";
 import { WorkflowStateManager } from "./services/WorkflowStateManager";
+import {
+  ExtractedConversationSchema,
+  PromptBundleSchema,
+  SessionInfoSchema,
+} from "./domain/Session";
 
 const extractorLayer = SessionExtractor.layer.pipe(Layer.provide(SessionStore.layer));
 const workflowExtractorLayer = Layer.effect(WorkflowSessionExtractor)(
@@ -59,6 +64,26 @@ const mainLayer = Layer.mergeAll(
   workflowLayer,
 );
 
+const makePrettyJsonSchema = <S extends Schema.Top>(schema: S) =>
+  Schema.String.pipe(
+    Schema.decodeTo(schema, {
+      decode: SchemaGetter.parseJson(),
+      encode: SchemaGetter.stringifyJson({ space: 2 }),
+    }),
+  );
+
+const sessionInfoListJsonSchema = makePrettyJsonSchema(Schema.Array(SessionInfoSchema));
+const extractedConversationListJsonSchema = makePrettyJsonSchema(
+  Schema.Array(ExtractedConversationSchema),
+);
+const promptBundleJsonSchema = makePrettyJsonSchema(PromptBundleSchema);
+
+const encodeSessionInfoListJson = Schema.encodeEffect(sessionInfoListJsonSchema);
+const encodeExtractedConversationListJson = Schema.encodeEffect(
+  extractedConversationListJsonSchema,
+);
+const encodePromptBundleJson = Schema.encodeEffect(promptBundleJsonSchema);
+
 const list = Command.make(
   "list",
   {
@@ -72,7 +97,7 @@ const list = Command.make(
     Effect.gen(function* () {
       const store = yield* SessionStore;
       const sessions = yield* store.listRecent(limit);
-      yield* Console.log(JSON.stringify(sessions, null, 2));
+      yield* encodeSessionInfoListJson(sessions).pipe(Effect.flatMap(Console.log));
     }),
 );
 
@@ -92,7 +117,7 @@ const extract = Command.make(
       const extracted = yield* Effect.forEach(sessionIds, (sessionId) =>
         extractor.extract(sessionId),
       );
-      yield* Console.log(JSON.stringify(extracted, null, 2));
+      yield* encodeExtractedConversationListJson(extracted).pipe(Effect.flatMap(Console.log));
     }),
 );
 
@@ -113,7 +138,11 @@ const prompt = Command.make(
         extractor.extract(sessionId),
       );
       const bundle = yield* composer.compose(extracted);
-      yield* Console.log(json ? JSON.stringify(bundle, null, 2) : bundle.prompt);
+      if (json) {
+        yield* encodePromptBundleJson(bundle).pipe(Effect.flatMap(Console.log));
+        return;
+      }
+      yield* Console.log(bundle.prompt);
     }),
 );
 
