@@ -20,6 +20,16 @@ export class CliError extends Schema.TaggedErrorClass<CliError>()("CliError", {
   message: Schema.String,
 }) {}
 
+export class SessionProviderError extends Schema.TaggedErrorClass<SessionProviderError>()(
+  "SessionProviderError",
+  {
+    message: Schema.String,
+    source: Schema.optional(Schema.String),
+    sessionId: Schema.optional(Schema.String),
+    path: Schema.optional(Schema.String),
+  },
+) {}
+
 export class StateError extends Schema.TaggedErrorClass<StateError>()("StateError", {
   code: Schema.String,
   message: Schema.String,

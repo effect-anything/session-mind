@@ -29,7 +29,7 @@
       ]
     },
     "JavaScript": {
-      "language_servers": ["vtsls", "oxlint", "oxfmt", "cspell"],
+      "language_servers": ["tsgo", "oxlint", "oxfmt", "cspell"],
 
       "formatter": [
         {
@@ -43,7 +43,7 @@
       ]
     },
     "TypeScript": {
-      "language_servers": ["vtsls", "oxlint", "oxfmt", "cspell"],
+      "language_servers": ["tsgo", "oxlint", "oxfmt", "cspell"],
       "formatter": [
         {
           "language_server": {
@@ -56,7 +56,7 @@
       ]
     },
     "TSX": {
-      "language_servers": ["vtsls", "oxlint", "oxfmt", "cspell"],
+      "language_servers": ["tsgo", "oxlint", "oxfmt", "cspell"],
       "formatter": [
         {
           "language_server": {
@@ -94,27 +94,11 @@
         }
       }
     },
-    "vtsls": {
+    "tsgo": {
       "settings": {
-        "tsserver": {
-          "maxTsServerMemory": 8092,
-          "enableRegionDiagnostics": true
-        },
-        "experimental": {
-          "completion": {
-            "entriesLimit": 10,
-            "enableServerSideFuzzyMatch": true
-          }
-        },
-        "autoUseWorkspaceTsdk": true,
         "typescript": {
-          "tsserver": { "maxTsServerMemory": 8092, "enableRegionDiagnostics": true },
-          "workspaceSymbols": { "scope": "currentProject" },
-          "preferGoToSourceDefinition": true,
-          "preferences": {
-            "importModuleSpecifier": "non-relative",
-            "autoImportSpecifierExcludeRegexes": ["^node:.*$", "effect/.*", "@effect/.*"]
-          }
+          "importModuleSpecifier": "non-relative",
+          "autoImportSpecifierExcludeRegexes": ["^node:.*$", "effect/.*", "@effect/.*"]
         }
       }
     },

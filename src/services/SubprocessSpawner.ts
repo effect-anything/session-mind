@@ -6,21 +6,27 @@ import {
   Fiber,
   FileSystem,
   Layer,
+  Option,
   Ref,
   Schema,
   ServiceMap,
   Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import type { PromptBundle } from "../domain/Session";
+import { parseSessionIdentifier, type PromptBundle } from "../domain/Session.ts";
 import {
   SessionMindOutputPaths,
   SubprocessEnvironmentVariable,
   SubprocessExitCode,
   SubprocessPromptBundleJsonSchema,
   SubprocessPromptBundlePrettyJsonSchema,
-} from "../domain/SubprocessProtocol";
-import { SubprocessError } from "../domain/SessionMindErrors";
+} from "../domain/SubprocessProtocol.ts";
+import { SubprocessError } from "../domain/SessionMindErrors.ts";
+import {
+  type WriterRevisionContext,
+  buildWriterTask,
+  resolveWriterPromptArgs,
+} from "./WriterTaskBuilder.ts";
 
 export type SpawnSubprocessRequest = {
   readonly command: string;
@@ -31,6 +37,9 @@ export type SpawnSubprocessRequest = {
   readonly outputDir: string;
   readonly timeoutMs?: number;
   readonly env?: Readonly<Record<string, string>>;
+  readonly stdioMode?: "capture" | "foreground";
+  readonly iteration?: number;
+  readonly revision?: WriterRevisionContext;
 };
 
 export type SpawnSubprocessResult = {
@@ -44,6 +53,8 @@ export type SpawnSubprocessResult = {
 
 const defaultTimeoutMs = 30 * 60 * 1000;
 const killGracePeriod = Duration.seconds(1);
+
+const artifactBackupSuffix = "previous-run";
 
 const isSubprocessError = (cause: unknown): cause is SubprocessError =>
   cause instanceof SubprocessError ||
@@ -74,6 +85,12 @@ const buildContext = ({
   ...(exitCode !== undefined ? { exitCode } : {}),
   ...(details !== undefined ? { details } : {}),
 });
+
+const toArtifactFingerprint = (info: FileSystem.File.Info) =>
+  `${Option.match(info.mtime, {
+    onNone: () => 0,
+    onSome: (mtime) => mtime.getTime(),
+  })}:${String(info.size)}`;
 
 const withCapturedOutput = (
   error: SubprocessError,
@@ -161,11 +178,50 @@ export class SubprocessSpawner extends ServiceMap.Service<
         outputDir,
         timeoutMs = defaultTimeoutMs,
         env,
+        stdioMode = "capture",
+        iteration = 1,
+        revision,
       }: SpawnSubprocessRequest) {
-        const articlesDir = join(outputDir, SessionMindOutputPaths.articlesDirectory);
-        const bundlesDir = join(outputDir, SessionMindOutputPaths.bundlesDirectory);
-        const artifactPath = join(articlesDir, `${sessionId}.md`);
-        const promptBundlePath = join(bundlesDir, `${sessionId}.prompt.json`);
+        const identifier = parseSessionIdentifier(sessionId);
+        const articlesDir = join(
+          outputDir,
+          SessionMindOutputPaths.draftsDirectory,
+          identifier.source,
+        );
+        const bundlesDir = join(
+          outputDir,
+          SessionMindOutputPaths.bundlesDirectory,
+          identifier.source,
+        );
+        const artifactPath = join(articlesDir, `${identifier.nativeId}.md`);
+        const backupArtifactPath = join(
+          articlesDir,
+          `${identifier.nativeId}.${artifactBackupSuffix}.${iteration}.md`,
+        );
+        const promptBundlePath = join(bundlesDir, `${identifier.nativeId}.prompt.json`);
+        if (stdioMode === "foreground" && (!process.stdin.isTTY || !process.stdout.isTTY)) {
+          return yield* new SubprocessError({
+            code: "SUBPROCESS_IO_FAILED",
+            message: "Foreground subprocess mode requires an interactive terminal",
+            context: buildContext({
+              command,
+              args,
+              cwd,
+              sessionId,
+              promptBundle,
+              outputDir,
+              timeoutMs,
+              stdioMode,
+              iteration,
+              ...(revision !== undefined ? { revision } : {}),
+              ...(env !== undefined ? { env } : {}),
+              details: {
+                stdinIsTTY: Boolean(process.stdin.isTTY),
+                stdoutIsTTY: Boolean(process.stdout.isTTY),
+              },
+            }),
+          });
+        }
         const request = {
           command,
           args,
@@ -174,6 +230,9 @@ export class SubprocessSpawner extends ServiceMap.Service<
           promptBundle,
           outputDir,
           timeoutMs,
+          stdioMode,
+          iteration,
+          ...(revision !== undefined ? { revision } : {}),
           ...(env !== undefined ? { env } : {}),
         } satisfies SpawnSubprocessRequest;
         const serializedPromptBundle = yield* encodePromptBundle({
@@ -217,9 +276,112 @@ export class SubprocessSpawner extends ServiceMap.Service<
 
         return yield* Effect.scoped(
           Effect.gen(function* () {
+            const artifactCommitted = yield* Ref.make(false);
+            const preparedArtifact = yield* Effect.acquireRelease(
+              Effect.gen(function* () {
+                const artifactExists = yield* fs.exists(artifactPath).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new SubprocessError({
+                        code: "SUBPROCESS_IO_FAILED",
+                        message: "Failed to inspect existing artifact before spawning subprocess",
+                        context: buildContext({
+                          ...request,
+                          details: { cause: String(cause), artifactPath },
+                        }),
+                      }),
+                  ),
+                );
+
+                if (!artifactExists) {
+                  return {
+                    backupPath: null,
+                    previousFingerprint: null,
+                    effectiveRevision: revision,
+                  } as const;
+                }
+
+                const previousArtifactInfo = yield* fs.stat(artifactPath).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new SubprocessError({
+                        code: "SUBPROCESS_IO_FAILED",
+                        message: "Failed to inspect existing artifact metadata",
+                        context: buildContext({
+                          ...request,
+                          details: { cause: String(cause), artifactPath },
+                        }),
+                      }),
+                  ),
+                );
+
+                yield* fs
+                  .remove(backupArtifactPath, { force: true })
+                  .pipe(Effect.catch(() => Effect.void));
+
+                yield* fs.rename(artifactPath, backupArtifactPath).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new SubprocessError({
+                        code: "SUBPROCESS_IO_FAILED",
+                        message: "Failed to move the previous artifact out of the way",
+                        context: buildContext({
+                          ...request,
+                          details: {
+                            cause: String(cause),
+                            artifactPath,
+                            backupArtifactPath,
+                          },
+                        }),
+                      }),
+                  ),
+                );
+
+                return {
+                  backupPath: backupArtifactPath,
+                  previousFingerprint: toArtifactFingerprint(previousArtifactInfo),
+                  effectiveRevision:
+                    revision === undefined
+                      ? undefined
+                      : {
+                          ...revision,
+                          previousArtifactPath: backupArtifactPath,
+                        },
+                } as const;
+              }),
+              ({ backupPath }) =>
+                backupPath === null
+                  ? Effect.void
+                  : Effect.gen(function* () {
+                      const committed = yield* Ref.get(artifactCommitted);
+                      if (committed) {
+                        yield* fs
+                          .remove(backupPath, { force: true })
+                          .pipe(Effect.catch(() => Effect.void));
+                        return;
+                      }
+
+                      yield* fs
+                        .remove(artifactPath, { force: true })
+                        .pipe(Effect.catch(() => Effect.void));
+                      yield* fs
+                        .rename(backupPath, artifactPath)
+                        .pipe(Effect.catch(() => Effect.void));
+                    }),
+            );
+            const writerTask = buildWriterTask({
+              sessionId,
+              outputDir,
+              promptBundle,
+              iteration,
+              ...(preparedArtifact.effectiveRevision !== undefined
+                ? { revision: preparedArtifact.effectiveRevision }
+                : {}),
+            });
+            const resolvedArgs = resolveWriterPromptArgs(args, writerTask);
             const handle = yield* spawner
               .spawn(
-                ChildProcess.make(command, [...args], {
+                ChildProcess.make(command, [...resolvedArgs], {
                   cwd,
                   env: {
                     ...env,
@@ -231,9 +393,9 @@ export class SubprocessSpawner extends ServiceMap.Service<
                     ),
                   },
                   extendEnv: true,
-                  stdin: "ignore",
-                  stdout: "pipe",
-                  stderr: "pipe",
+                  stdin: stdioMode === "foreground" ? "inherit" : "ignore",
+                  stdout: stdioMode === "foreground" ? "inherit" : "pipe",
+                  stderr: stdioMode === "foreground" ? "inherit" : "pipe",
                 }),
               )
               .pipe(
@@ -250,65 +412,81 @@ export class SubprocessSpawner extends ServiceMap.Service<
                 ),
               );
 
-            const stdoutRef = yield* Ref.make("");
-            const stderrRef = yield* Ref.make("");
-
-            const stdoutFiber = yield* handle.stdout.pipe(
-              Stream.decodeText(),
-              Stream.runForEach((chunk) => Ref.update(stdoutRef, (stdout) => `${stdout}${chunk}`)),
-              Effect.forkChild,
-            );
-
-            const stderrFiber = yield* handle.stderr.pipe(
-              Stream.decodeText(),
-              Stream.runForEach((chunk) => Ref.update(stderrRef, (stderr) => `${stderr}${chunk}`)),
-              Effect.forkChild,
-            );
-
-            const bestEffortOutput = Effect.gen(function* () {
-              yield* Fiber.await(stdoutFiber);
-              yield* Fiber.await(stderrFiber);
-
-              return {
-                stdout: yield* Ref.get(stdoutRef),
-                stderr: yield* Ref.get(stderrRef),
-              } as const;
+            const outputRefs = yield* Effect.all({
+              stdoutRef: Ref.make(""),
+              stderrRef: Ref.make(""),
             });
 
-            const readOutput = Effect.gen(function* () {
-              yield* Fiber.join(stdoutFiber).pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new SubprocessError({
-                      code: "SUBPROCESS_IO_FAILED",
-                      message: "Failed to capture subprocess stdout",
-                      context: buildContext({
-                        ...request,
-                        details: { cause: String(cause) },
-                      }),
-                    }),
-                ),
-              );
+            const outputCapture =
+              stdioMode === "foreground"
+                ? null
+                : {
+                    stdoutFiber: yield* handle.stdout.pipe(
+                      Stream.decodeText(),
+                      Stream.runForEach((chunk) =>
+                        Ref.update(outputRefs.stdoutRef, (stdout) => `${stdout}${chunk}`),
+                      ),
+                      Effect.forkChild,
+                    ),
+                    stderrFiber: yield* handle.stderr.pipe(
+                      Stream.decodeText(),
+                      Stream.runForEach((chunk) =>
+                        Ref.update(outputRefs.stderrRef, (stderr) => `${stderr}${chunk}`),
+                      ),
+                      Effect.forkChild,
+                    ),
+                  };
 
-              yield* Fiber.join(stderrFiber).pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new SubprocessError({
-                      code: "SUBPROCESS_IO_FAILED",
-                      message: "Failed to capture subprocess stderr",
-                      context: buildContext({
-                        ...request,
-                        details: { cause: String(cause) },
-                      }),
-                    }),
-                ),
-              );
+            const bestEffortOutput =
+              outputCapture === null
+                ? Effect.succeed({ stdout: "", stderr: "" } as const)
+                : Effect.gen(function* () {
+                    yield* Fiber.await(outputCapture.stdoutFiber);
+                    yield* Fiber.await(outputCapture.stderrFiber);
 
-              return {
-                stdout: yield* Ref.get(stdoutRef),
-                stderr: yield* Ref.get(stderrRef),
-              } as const;
-            });
+                    return {
+                      stdout: yield* Ref.get(outputRefs.stdoutRef),
+                      stderr: yield* Ref.get(outputRefs.stderrRef),
+                    } as const;
+                  });
+
+            const readOutput =
+              outputCapture === null
+                ? Effect.succeed({ stdout: "", stderr: "" } as const)
+                : Effect.gen(function* () {
+                    yield* Fiber.join(outputCapture.stdoutFiber).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new SubprocessError({
+                            code: "SUBPROCESS_IO_FAILED",
+                            message: "Failed to capture subprocess stdout",
+                            context: buildContext({
+                              ...request,
+                              details: { cause: String(cause) },
+                            }),
+                          }),
+                      ),
+                    );
+
+                    yield* Fiber.join(outputCapture.stderrFiber).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new SubprocessError({
+                            code: "SUBPROCESS_IO_FAILED",
+                            message: "Failed to capture subprocess stderr",
+                            context: buildContext({
+                              ...request,
+                              details: { cause: String(cause) },
+                            }),
+                          }),
+                      ),
+                    );
+
+                    return {
+                      stdout: yield* Ref.get(outputRefs.stdoutRef),
+                      stderr: yield* Ref.get(outputRefs.stderrRef),
+                    } as const;
+                  });
 
             const exitCode = yield* handle.exitCode.pipe(
               Effect.map(Number),
@@ -399,6 +577,49 @@ export class SubprocessSpawner extends ServiceMap.Service<
                 }),
               });
             }
+
+            if (preparedArtifact.previousFingerprint !== null) {
+              const currentArtifactInfo = yield* fs.stat(artifactPath).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new SubprocessError({
+                      code: "SUBPROCESS_IO_FAILED",
+                      message: "Failed to inspect generated artifact metadata",
+                      context: buildContext({
+                        ...request,
+                        exitCode,
+                        details: {
+                          cause: String(cause),
+                          artifactPath,
+                          promptBundlePath,
+                          ...output,
+                        },
+                      }),
+                    }),
+                ),
+              );
+
+              if (
+                preparedArtifact.previousFingerprint === toArtifactFingerprint(currentArtifactInfo)
+              ) {
+                return yield* new SubprocessError({
+                  code: "SUBPROCESS_PROTOCOL_VIOLATION",
+                  message: "Subprocess exited successfully without updating the artifact output",
+                  context: buildContext({
+                    ...request,
+                    exitCode,
+                    details: {
+                      artifactPath,
+                      promptBundlePath,
+                      backupArtifactPath: preparedArtifact.backupPath,
+                      ...output,
+                    },
+                  }),
+                });
+              }
+            }
+
+            yield* Ref.set(artifactCommitted, true);
 
             return {
               sessionId,

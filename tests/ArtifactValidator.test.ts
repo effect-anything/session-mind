@@ -3,7 +3,10 @@ import { Effect, Schema } from "effect";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ArtifactValidator, defaultArtifactMinimumLength } from "../src/services/ArtifactValidator";
+import {
+  ArtifactValidator,
+  defaultArtifactMinimumLength,
+} from "../src/services/ArtifactValidator.ts";
 
 class TestFileSystemError extends Schema.TaggedErrorClass<TestFileSystemError>()(
   "TestFileSystemError",

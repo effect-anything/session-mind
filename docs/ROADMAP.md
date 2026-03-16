@@ -28,7 +28,7 @@ downstream writing agent.
 
 ### Working Now
 
-- `bunx tsc --noEmit`
+- `bunx tsgo --noEmit`
 - `bun run src/cli/main.ts list --limit 3`
 - `bun run src/cli/main.ts extract <session-id>`
 - `bun run src/cli/main.ts prompt <session-id> --json`

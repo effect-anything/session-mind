@@ -1,4 +1,16 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
-  "ignorePatterns": [".repo", ".direnv/**"]
+  "ignorePatterns": [
+    ".git",
+    ".repo",
+    ".direnv",
+    ".lalph",
+    ".codemogger",
+    ".specs",
+    ".jj",
+    "dist",
+    "node_modules",
+    "bun.lock",
+    "flake.lock"
+  ]
 }

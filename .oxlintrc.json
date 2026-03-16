@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": null,
+  "plugins": [],
   "categories": {},
   "overrides": [
     {
@@ -21,14 +21,13 @@
   },
   "settings": {
     "jsx-a11y": {
-      "polymorphicPropName": null,
       "components": {},
       "attributes": {}
     },
     "react": {
       "formComponents": [],
       "linkComponents": [],
-      "version": null,
+      "version": "19",
       "componentWrapperFunctions": []
     },
     "jsdoc": {
@@ -50,13 +49,16 @@
   },
   "globals": {},
   "ignorePatterns": [
-    ".repo/**",
-    ".direnv/**",
-    ".lalph/**",
-    ".codemogger/**",
-    ".specs/**",
-    ".jj/**",
-    "dist/**",
-    "node_modules/**"
+    ".git",
+    ".repo",
+    ".direnv",
+    ".lalph",
+    ".codemogger",
+    ".specs",
+    ".jj",
+    "dist",
+    "node_modules",
+    "bun.lock",
+    "flake.lock"
   ]
 }

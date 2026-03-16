@@ -1,14 +1,18 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect } from "effect";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ExtractedConversation, PromptBundle } from "../src/domain/Session";
+import type { ExtractedConversation, PromptBundle } from "../src/domain/Session.ts";
 import {
   SessionMindOutputPaths,
   SubprocessEnvironmentVariable,
-} from "../src/domain/SubprocessProtocol";
-import { SubprocessSpawner } from "../src/services/SubprocessSpawner";
+} from "../src/domain/SubprocessProtocol.ts";
+import { SubprocessSpawner } from "../src/services/SubprocessSpawner.ts";
+import {
+  WriterPromptArgumentPlaceholder,
+  buildWriterTask,
+} from "../src/services/WriterTaskBuilder.ts";
 
 const tempDirectories: Array<string> = [];
 
@@ -50,7 +54,7 @@ const extractedConversation: ExtractedConversation = {
 
 const promptBundle: PromptBundle = {
   topicHint: "Workflow session",
-  prompt: "Write the article.",
+  writingBrief: "Write the article.",
   sourceSessionIds: ["session-1"],
   generatedAt: 4,
   extracted: [extractedConversation],
@@ -81,30 +85,42 @@ afterEach(async () => {
 describe("SubprocessSpawner", () => {
   it("spawns a subprocess, passes protocol environment variables, and captures success output", async () => {
     const directory = await createTempDirectory();
+    const outputDir = join(directory, SessionMindOutputPaths.workflowRoot);
+    const expectedWriterTask = buildWriterTask({
+      sessionId: "session-1",
+      outputDir,
+      promptBundle,
+    });
     const script = [
       "const fs = require('node:fs');",
       "const path = require('node:path');",
+      "const writerPrompt = process.argv[1];",
       `const compactBundleText = process.env.${SubprocessEnvironmentVariable.promptBundle};`,
       "const bundle = JSON.parse(compactBundleText);",
       `const outputDir = process.env.${SubprocessEnvironmentVariable.outputDir};`,
       `const sessionId = process.env.${SubprocessEnvironmentVariable.sessionId};`,
-      "const bundlePath = path.join(outputDir, 'bundles', `${sessionId}.prompt.json`);",
+      "const bundlePath = path.join(outputDir, 'bundles', 'opencode', `${sessionId}.prompt.json`);",
       "const persistedBundleRaw = fs.readFileSync(bundlePath, 'utf8');",
       "const persistedBundleText = persistedBundleRaw;",
       `const envBundleRaw = process.env.${SubprocessEnvironmentVariable.promptBundle};`,
       "const persistedBundle = JSON.parse(persistedBundleRaw);",
-      "const artifactPath = path.join(outputDir, 'articles', `${sessionId}.md`);",
+      `const artifactPath = path.join(outputDir, '${SessionMindOutputPaths.draftsDirectory}', 'opencode', sessionId + '.md');`,
       "fs.mkdirSync(path.dirname(artifactPath), { recursive: true });",
       "if (compactBundleText !== JSON.stringify(bundle)) { process.exit(6); }",
       "if (persistedBundleText !== JSON.stringify(bundle, null, 2)) { process.exit(7); }",
       "if (persistedBundle.topicHint !== bundle.topicHint) { process.exit(5); }",
       "fs.writeFileSync(artifactPath, `# ${bundle.topicHint}\\n\\nThis generated article content is intentionally long enough to pass validation.`);",
-      "process.stdout.write(JSON.stringify({ sessionId, envBundleRaw, persistedBundleRaw, sourceSessionIds: persistedBundle.sourceSessionIds }));",
+      "process.stdout.write(JSON.stringify({ sessionId, writerPrompt, envBundleRaw, persistedBundleRaw, sourceSessionIds: persistedBundle.sourceSessionIds }));",
     ].join("");
 
-    const result = await spawnSubprocess(directory, ["-e", script], 1_000);
+    const result = await spawnSubprocess(
+      directory,
+      ["-e", script, WriterPromptArgumentPlaceholder],
+      1_000,
+    );
     const stdoutPayload = JSON.parse(result.stdout) as {
       sessionId: string;
+      writerPrompt: string;
       envBundleRaw: string;
       persistedBundleRaw: string;
       sourceSessionIds: ReadonlyArray<string>;
@@ -113,12 +129,19 @@ describe("SubprocessSpawner", () => {
     expect(result.exitCode).toBe(0);
     expect(stdoutPayload).toEqual({
       sessionId: "session-1",
+      writerPrompt: expectedWriterTask.prompt,
       envBundleRaw: JSON.stringify(promptBundle),
       persistedBundleRaw: JSON.stringify(promptBundle, null, 2),
       sourceSessionIds: ["session-1"],
     });
     expect(result.artifactPath).toBe(
-      join(directory, SessionMindOutputPaths.workflowRoot, "articles", "session-1.md"),
+      join(
+        directory,
+        SessionMindOutputPaths.workflowRoot,
+        SessionMindOutputPaths.draftsDirectory,
+        "opencode",
+        "session-1.md",
+      ),
     );
 
     const persistedBundle = JSON.parse(
@@ -141,6 +164,67 @@ describe("SubprocessSpawner", () => {
         }),
       }),
     });
+  });
+
+  it("does not treat a stale artifact as fresh output and restores the previous file on protocol failure", async () => {
+    const directory = await createTempDirectory();
+    const outputDir = join(directory, SessionMindOutputPaths.workflowRoot);
+    const artifactPath = join(
+      outputDir,
+      SessionMindOutputPaths.draftsDirectory,
+      "opencode",
+      "session-1.md",
+    );
+    const oldArtifact = "# previous\n\nKeep me if the new run never writes.";
+
+    await mkdir(join(outputDir, SessionMindOutputPaths.draftsDirectory, "opencode"), {
+      recursive: true,
+    });
+    await writeFile(artifactPath, oldArtifact, "utf8");
+
+    const script = "process.stdout.write('no artifact');";
+
+    await expect(spawnSubprocess(directory, ["-e", script], 1_000)).rejects.toMatchObject({
+      _tag: "SubprocessError",
+      code: "SUBPROCESS_PROTOCOL_VIOLATION",
+    });
+
+    await expect(readFile(artifactPath, "utf8")).resolves.toBe(oldArtifact);
+  });
+
+  it("restores the previous artifact when the subprocess fails after a prior draft exists", async () => {
+    const directory = await createTempDirectory();
+    const outputDir = join(directory, SessionMindOutputPaths.workflowRoot);
+    const artifactPath = join(
+      outputDir,
+      SessionMindOutputPaths.draftsDirectory,
+      "opencode",
+      "session-1.md",
+    );
+    const oldArtifact = "# previous\n\nThe earlier draft should survive worker failure.";
+    const script = [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      `const outputDir = process.env.${SubprocessEnvironmentVariable.outputDir};`,
+      `const sessionId = process.env.${SubprocessEnvironmentVariable.sessionId};`,
+      `const artifactPath = path.join(outputDir, '${SessionMindOutputPaths.draftsDirectory}', 'opencode', sessionId + '.md');`,
+      "fs.mkdirSync(path.dirname(artifactPath), { recursive: true });",
+      "fs.writeFileSync(artifactPath, '# partial\\n\\nThis should be discarded.', 'utf8');",
+      "process.stderr.write('boom');",
+      "process.exit(3);",
+    ].join("");
+
+    await mkdir(join(outputDir, SessionMindOutputPaths.draftsDirectory, "opencode"), {
+      recursive: true,
+    });
+    await writeFile(artifactPath, oldArtifact, "utf8");
+
+    await expect(spawnSubprocess(directory, ["-e", script], 1_000)).rejects.toMatchObject({
+      _tag: "SubprocessError",
+      code: "SUBPROCESS_EXITED_NON_ZERO",
+    });
+
+    await expect(readFile(artifactPath, "utf8")).resolves.toBe(oldArtifact);
   });
 
   it("returns a typed error when the subprocess exits non-zero", async () => {

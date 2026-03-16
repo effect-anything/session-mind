@@ -1,8 +1,7 @@
+import type { DatabaseSync } from "node:sqlite";
 import { Effect, Layer, Schema, ServiceMap } from "effect";
-import { SqliteClient } from "@effect/sql-sqlite-bun";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
-import { DbError, ParseError, SessionNotFoundError } from "../errors/AppError";
-import { SessionInfoSchema, type SessionInfo } from "../domain/Session";
+import { DbError, ParseError, SessionNotFoundError } from "../errors/AppError.ts";
+import { SessionInfoSchema, type SessionInfo } from "../domain/Session.ts";
 
 export type MessageRow = {
   readonly id: string;
@@ -25,6 +24,31 @@ type SessionRow = SessionInfo & {
   readonly timeUpdated: number;
 };
 
+const databasePath = () => {
+  const homeDirectory = process.env["HOME"];
+  if (!homeDirectory) {
+    throw new Error("HOME is not set");
+  }
+
+  return `${homeDirectory}/.local/share/opencode/opencode-local.db`;
+};
+
+const openDatabase = () =>
+  Effect.tryPromise({
+    try: async () => {
+      const { DatabaseSync } = await import("node:sqlite");
+      return new DatabaseSync(databasePath(), { readOnly: true });
+    },
+    catch: (cause) => new DbError({ message: String(cause) }),
+  });
+
+const runAll = <TRow>(database: DatabaseSync, query: string, parameters: ReadonlyArray<unknown>) =>
+  Effect.try({
+    try: () =>
+      database.prepare(query).all(...(parameters as Array<any>)) as unknown as ReadonlyArray<TRow>,
+    catch: (cause) => new DbError({ message: String(cause) }),
+  });
+
 export class SessionStore extends ServiceMap.Service<
   SessionStore,
   {
@@ -36,26 +60,37 @@ export class SessionStore extends ServiceMap.Service<
     getPartRows(sessionId: string): Effect.Effect<ReadonlyArray<PartRow>, DbError>;
   }
 >()("session-article/SessionStore") {
-  static readonly layer = Layer.effect(SessionStore)(
+  static readonly layer = Layer.effect(
+    SessionStore,
     Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
       const decodeSession = Schema.decodeUnknownEffect(SessionInfoSchema);
+      let database: DatabaseSync | undefined;
+
+      const getDatabase = () =>
+        Effect.gen(function* () {
+          if (database !== undefined) {
+            return database;
+          }
+
+          database = yield* openDatabase();
+          return database;
+        });
 
       const listRecent = Effect.fn("SessionStore.listRecent")(function* (limit: number) {
-        const rows = yield* sql
-          .unsafe<SessionRow>(
-            `SELECT id,
-                  title,
-                  directory,
-                  time_created AS timeCreated,
-                  time_updated AS timeUpdated,
-                  project_id AS projectId
-           FROM session
-           ORDER BY time_updated DESC
-           LIMIT ?`,
-            [limit],
-          )
-          .pipe(Effect.mapError((cause) => new DbError({ message: String(cause) })));
+        const database = yield* getDatabase();
+        const rows = yield* runAll<SessionRow>(
+          database,
+          `SELECT id,
+                title,
+                directory,
+                time_created AS timeCreated,
+                time_updated AS timeUpdated,
+                project_id AS projectId
+         FROM session
+         ORDER BY time_updated DESC
+         LIMIT ?`,
+          [limit],
+        );
 
         return yield* Effect.forEach(rows, (row) =>
           decodeSession(row).pipe(
@@ -67,19 +102,19 @@ export class SessionStore extends ServiceMap.Service<
       const getSessionById = Effect.fn("SessionStore.getSessionById")(function* (
         sessionId: string,
       ) {
-        const rows = yield* sql
-          .unsafe<SessionRow>(
-            `SELECT id,
-                  title,
-                  directory,
-                  time_created AS timeCreated,
-                  time_updated AS timeUpdated,
-                  project_id AS projectId
-           FROM session
-           WHERE id = ?`,
-            [sessionId],
-          )
-          .pipe(Effect.mapError((cause) => new DbError({ message: String(cause) })));
+        const database = yield* getDatabase();
+        const rows = yield* runAll<SessionRow>(
+          database,
+          `SELECT id,
+                title,
+                directory,
+                time_created AS timeCreated,
+                time_updated AS timeUpdated,
+                project_id AS projectId
+         FROM session
+         WHERE id = ?`,
+          [sessionId],
+        );
 
         const row = rows[0];
         if (!row) {
@@ -94,35 +129,35 @@ export class SessionStore extends ServiceMap.Service<
       const getMessageRows = Effect.fn("SessionStore.getMessageRows")(function* (
         sessionId: string,
       ) {
-        return yield* sql
-          .unsafe<MessageRow>(
-            `SELECT id,
-                  session_id AS sessionId,
-                  time_created AS timeCreated,
-                  time_updated AS timeUpdated,
-                  data
-           FROM message
-           WHERE session_id = ?
-           ORDER BY time_created ASC`,
-            [sessionId],
-          )
-          .pipe(Effect.mapError((cause) => new DbError({ message: String(cause) })));
+        const database = yield* getDatabase();
+        return yield* runAll<MessageRow>(
+          database,
+          `SELECT id,
+                session_id AS sessionId,
+                time_created AS timeCreated,
+                time_updated AS timeUpdated,
+                data
+         FROM message
+         WHERE session_id = ?
+         ORDER BY time_created ASC`,
+          [sessionId],
+        );
       });
 
       const getPartRows = Effect.fn("SessionStore.getPartRows")(function* (sessionId: string) {
-        return yield* sql
-          .unsafe<PartRow>(
-            `SELECT id,
-                  message_id AS messageId,
-                  session_id AS sessionId,
-                  time_created AS timeCreated,
-                  data
-           FROM part
-           WHERE session_id = ?
-           ORDER BY time_created ASC`,
-            [sessionId],
-          )
-          .pipe(Effect.mapError((cause) => new DbError({ message: String(cause) })));
+        const database = yield* getDatabase();
+        return yield* runAll<PartRow>(
+          database,
+          `SELECT id,
+                message_id AS messageId,
+                session_id AS sessionId,
+                time_created AS timeCreated,
+                data
+         FROM part
+         WHERE session_id = ?
+         ORDER BY time_created ASC`,
+          [sessionId],
+        );
       });
 
       return SessionStore.of({
@@ -132,15 +167,5 @@ export class SessionStore extends ServiceMap.Service<
         getPartRows,
       });
     }),
-  ).pipe(
-    Layer.provide(
-      SqliteClient.layer({
-        // @ts-expect-error
-        filename: `${process.env.HOME}/.local/share/opencode/opencode-local.db`,
-        readonly: true,
-        readwrite: false,
-        create: false,
-      }),
-    ),
   );
 }

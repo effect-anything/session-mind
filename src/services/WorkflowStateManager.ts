@@ -1,13 +1,15 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Effect, Layer, Option, Schema, Semaphore, ServiceMap } from "effect";
-import { StateError } from "../domain/SessionMindErrors";
+import { ArticleStatusSchema, type ArticleStatus } from "../domain/Article.ts";
+import { StateError } from "../domain/SessionMindErrors.ts";
 
 export const WorkflowStageSchema = Schema.Literals([
   "extracting",
   "generating",
   "executing",
   "validating",
+  "reviewing",
   "complete",
   "failed",
 ]);
@@ -19,6 +21,7 @@ export const ActiveWorkflowStageSchema = Schema.Literals([
   "generating",
   "executing",
   "validating",
+  "reviewing",
 ]);
 
 export type ActiveWorkflowStage = Schema.Schema.Type<typeof ActiveWorkflowStageSchema>;
@@ -26,8 +29,11 @@ export type ActiveWorkflowStage = Schema.Schema.Type<typeof ActiveWorkflowStageS
 export const SessionWorkflowStateSchema = Schema.Struct({
   sessionId: Schema.String,
   stage: WorkflowStageSchema,
+  articleStatus: ArticleStatusSchema,
   artifactPath: Schema.String,
   promptBundlePath: Schema.optional(Schema.String),
+  iteration: Schema.Number,
+  lastValidationIssues: Schema.optional(Schema.Array(Schema.String)),
   updatedAt: Schema.Number,
   retryCount: Schema.Number,
   lastStableStage: Schema.optional(ActiveWorkflowStageSchema),
@@ -59,6 +65,7 @@ export type InitializeSessionRequest = {
   readonly stateFilePath: string;
   readonly sessionId: string;
   readonly artifactPath: string;
+  readonly articleStatus?: ArticleStatus;
 };
 
 export type TransitionWorkflowRequest = {
@@ -67,6 +74,15 @@ export type TransitionWorkflowRequest = {
   readonly nextStage: WorkflowStage;
   readonly artifactPath?: string;
   readonly promptBundlePath?: string;
+  readonly iteration?: number;
+  readonly lastValidationIssues?: ReadonlyArray<string>;
+};
+
+export type SetArticleStatusRequest = {
+  readonly stateFilePath: string;
+  readonly sessionId: string;
+  readonly articleStatus: ArticleStatus;
+  readonly artifactPath: string;
 };
 
 export type MarkWorkflowFailureRequest = {
@@ -86,21 +102,21 @@ const allowedTransitions: Readonly<Record<WorkflowStage, ReadonlyArray<WorkflowS
   extracting: ["generating", "failed"],
   generating: ["executing", "failed"],
   executing: ["validating", "failed"],
-  validating: ["complete", "failed"],
-  complete: [],
-  failed: ["extracting", "generating", "executing", "validating"],
+  validating: ["generating", "reviewing", "complete", "failed"],
+  reviewing: ["generating", "complete", "failed"],
+  complete: ["generating"],
+  failed: ["extracting", "generating", "executing", "validating", "reviewing"],
 };
 
 const isActiveStage = (stage: WorkflowStage): stage is ActiveWorkflowStage =>
   stage === "extracting" ||
   stage === "generating" ||
   stage === "executing" ||
-  stage === "validating";
+  stage === "validating" ||
+  stage === "reviewing";
 
 const defaultNextStageForFailure = (state: SessionWorkflowState): ActiveWorkflowStage =>
-  state.lastStableStage === "validating"
-    ? "executing"
-    : (state.lastStableStage ?? "extracting");
+  state.lastStableStage === "validating" ? "executing" : (state.lastStableStage ?? "extracting");
 
 const readStateFile = (stateFilePath: string): Effect.Effect<WorkflowState, StateError> =>
   Effect.tryPromise({
@@ -173,6 +189,9 @@ export class WorkflowStateManager extends ServiceMap.Service<
       request: InitializeSessionRequest,
     ): Effect.Effect<SessionWorkflowState, StateError>;
     transition(request: TransitionWorkflowRequest): Effect.Effect<SessionWorkflowState, StateError>;
+    setArticleStatus(
+      request: SetArticleStatusRequest,
+    ): Effect.Effect<SessionWorkflowState, StateError>;
     markFailure(
       request: MarkWorkflowFailureRequest,
     ): Effect.Effect<SessionWorkflowState, StateError>;
@@ -212,6 +231,7 @@ export class WorkflowStateManager extends ServiceMap.Service<
         stateFilePath,
         sessionId,
         artifactPath,
+        articleStatus,
       }: InitializeSessionRequest) {
         return yield* withStateLock(
           Effect.gen(function* () {
@@ -225,6 +245,8 @@ export class WorkflowStateManager extends ServiceMap.Service<
               sessionId,
               stage: "extracting",
               artifactPath,
+              articleStatus: articleStatus ?? "draft",
+              iteration: 1,
               updatedAt: Date.now(),
               retryCount: 0,
               lastStableStage: "extracting",
@@ -250,6 +272,8 @@ export class WorkflowStateManager extends ServiceMap.Service<
         nextStage,
         artifactPath,
         promptBundlePath,
+        iteration,
+        lastValidationIssues,
       }: TransitionWorkflowRequest) {
         return yield* withStateLock(
           Effect.gen(function* () {
@@ -287,7 +311,9 @@ export class WorkflowStateManager extends ServiceMap.Service<
               ...currentWithoutLastError,
               stage: nextStage,
               artifactPath: artifactPath ?? current.artifactPath,
+              iteration: iteration ?? current.iteration,
               updatedAt: Date.now(),
+              retryCount: nextStage === "complete" ? 0 : current.retryCount,
               ...(isActiveStage(nextStage)
                 ? { lastStableStage: nextStage }
                 : current.lastStableStage !== undefined
@@ -298,6 +324,55 @@ export class WorkflowStateManager extends ServiceMap.Service<
                 : current.promptBundlePath !== undefined
                   ? { promptBundlePath: current.promptBundlePath }
                   : {}),
+              ...(lastValidationIssues !== undefined
+                ? { lastValidationIssues: [...lastValidationIssues] }
+                : current.lastValidationIssues !== undefined
+                  ? { lastValidationIssues: current.lastValidationIssues }
+                  : {}),
+            };
+
+            const nextStateObject: WorkflowState = {
+              ...state,
+              sessions: {
+                ...state.sessions,
+                [sessionId]: nextSessionState,
+              },
+            };
+
+            yield* persistStateFile(stateFilePath, nextStateObject);
+            return nextSessionState;
+          }),
+        );
+      });
+
+      const setArticleStatus = Effect.fn("WorkflowStateManager.setArticleStatus")(function* ({
+        stateFilePath,
+        sessionId,
+        articleStatus,
+        artifactPath,
+      }: SetArticleStatusRequest) {
+        return yield* withStateLock(
+          Effect.gen(function* () {
+            const state = yield* readState(stateFilePath);
+            const current = state.sessions[sessionId];
+
+            if (!current) {
+              return yield* new StateError({
+                code: "STATE_TRANSITION_INVALID",
+                message: "Cannot update article status without session state",
+                context: {
+                  stateFilePath,
+                  sessionId,
+                  details: { articleStatus, artifactPath },
+                },
+              });
+            }
+
+            const nextSessionState: SessionWorkflowState = {
+              ...current,
+              articleStatus,
+              artifactPath,
+              updatedAt: Date.now(),
             };
 
             const nextStateObject: WorkflowState = {
@@ -370,6 +445,14 @@ export class WorkflowStateManager extends ServiceMap.Service<
         }
 
         if (current.stage === "complete") {
+          if (current.articleStatus === "draft") {
+            return {
+              action: "resume",
+              nextStage: "generating",
+              state: current,
+            } satisfies WorkflowRecovery;
+          }
+
           return {
             action: "complete",
             state: current,
@@ -409,6 +492,7 @@ export class WorkflowStateManager extends ServiceMap.Service<
         getSessionState,
         initializeSession,
         transition,
+        setArticleStatus,
         markFailure,
         recoverSession,
       });

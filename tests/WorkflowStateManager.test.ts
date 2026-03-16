@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { WorkflowStateManager } from "../src/services/WorkflowStateManager";
+import { WorkflowStateManager } from "../src/services/WorkflowStateManager.ts";
 
 const tempDirectories: Array<string> = [];
 
@@ -64,7 +64,9 @@ describe("WorkflowStateManager", () => {
         });
 
         expect(completeState.stage).toBe("complete");
+        expect(completeState.articleStatus).toBe("draft");
         expect(completeState.retryCount).toBe(0);
+        expect(completeState.iteration).toBe(1);
 
         const stateFileContent = yield* Effect.tryPromise(() => readFile(stateFilePath, "utf8"));
         expect(stateFileContent).toContain('"version": 1');
@@ -141,6 +143,111 @@ describe("WorkflowStateManager", () => {
     );
   });
 
+  it("reopens completed drafts by resuming at generating", async () => {
+    await runWithWorkflowStateManager(
+      Effect.gen(function* () {
+        const manager = yield* WorkflowStateManager;
+        const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
+        const stateFilePath = join(rootDirectory, "state.json");
+        const artifactPath = join(rootDirectory, "artifact.md");
+
+        yield* manager.initializeSession({
+          stateFilePath,
+          sessionId: "session-reopen",
+          artifactPath,
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-reopen",
+          nextStage: "generating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-reopen",
+          nextStage: "executing",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-reopen",
+          nextStage: "validating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-reopen",
+          nextStage: "complete",
+        });
+
+        const recovery = yield* manager.recoverSession(stateFilePath, "session-reopen");
+
+        expect(recovery.action).toBe("resume");
+        if (recovery.action === "resume") {
+          expect(recovery.nextStage).toBe("generating");
+          expect(recovery.state.articleStatus).toBe("draft");
+        }
+      }),
+    );
+  });
+
+  it("treats published articles as immutable complete items until moved back to draft", async () => {
+    await runWithWorkflowStateManager(
+      Effect.gen(function* () {
+        const manager = yield* WorkflowStateManager;
+        const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
+        const stateFilePath = join(rootDirectory, "state.json");
+        const artifactPath = join(rootDirectory, "draft.md");
+
+        yield* manager.initializeSession({
+          stateFilePath,
+          sessionId: "session-published",
+          artifactPath,
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-published",
+          nextStage: "generating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-published",
+          nextStage: "executing",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-published",
+          nextStage: "validating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-published",
+          nextStage: "complete",
+        });
+
+        yield* manager.setArticleStatus({
+          stateFilePath,
+          sessionId: "session-published",
+          articleStatus: "published",
+          artifactPath: join(rootDirectory, "published.md"),
+        });
+
+        const recovery = yield* manager.recoverSession(stateFilePath, "session-published");
+
+        expect(recovery.action).toBe("complete");
+        if (recovery.action === "complete") {
+          expect(recovery.state.articleStatus).toBe("published");
+          expect(recovery.state.artifactPath).toBe(join(rootDirectory, "published.md"));
+        }
+      }),
+    );
+  });
+
   it("retries failed validation runs from executing so the artifact can be regenerated", async () => {
     await runWithWorkflowStateManager(
       Effect.gen(function* () {
@@ -187,6 +294,206 @@ describe("WorkflowStateManager", () => {
           expect(recovery.nextStage).toBe("executing");
           expect(recovery.state.stage).toBe("failed");
           expect(recovery.state.lastStableStage).toBe("validating");
+          expect(recovery.state.retryCount).toBe(1);
+        }
+      }),
+    );
+  });
+
+  it("allows validation failures to move back to generating for the next loop iteration", async () => {
+    await runWithWorkflowStateManager(
+      Effect.gen(function* () {
+        const manager = yield* WorkflowStateManager;
+        const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
+        const stateFilePath = join(rootDirectory, "state.json");
+        const artifactPath = join(rootDirectory, "artifact.md");
+
+        yield* manager.initializeSession({
+          stateFilePath,
+          sessionId: "session-loop",
+          artifactPath,
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-loop",
+          nextStage: "generating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-loop",
+          nextStage: "executing",
+          promptBundlePath: join(rootDirectory, "prompt.json"),
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-loop",
+          nextStage: "validating",
+        });
+
+        const nextIteration = yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-loop",
+          nextStage: "generating",
+          iteration: 2,
+          lastValidationIssues: ["Artifact content must be at least 200 characters."],
+        });
+
+        expect(nextIteration.stage).toBe("generating");
+        expect(nextIteration.iteration).toBe(2);
+        expect(nextIteration.lastValidationIssues).toEqual([
+          "Artifact content must be at least 200 characters.",
+        ]);
+      }),
+    );
+  });
+
+  it("allows reviewer feedback to reopen generation for another article pass", async () => {
+    await runWithWorkflowStateManager(
+      Effect.gen(function* () {
+        const manager = yield* WorkflowStateManager;
+        const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
+        const stateFilePath = join(rootDirectory, "state.json");
+        const artifactPath = join(rootDirectory, "artifact.md");
+
+        yield* manager.initializeSession({
+          stateFilePath,
+          sessionId: "session-review-loop",
+          artifactPath,
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-review-loop",
+          nextStage: "generating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-review-loop",
+          nextStage: "executing",
+          promptBundlePath: join(rootDirectory, "prompt.json"),
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-review-loop",
+          nextStage: "validating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-review-loop",
+          nextStage: "reviewing",
+        });
+
+        const nextIteration = yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-review-loop",
+          nextStage: "generating",
+          iteration: 2,
+          lastValidationIssues: ["Reviewer revision brief: 重写标题和开头，减少口语化表达。"],
+        });
+
+        expect(nextIteration.stage).toBe("generating");
+        expect(nextIteration.iteration).toBe(2);
+        expect(nextIteration.lastStableStage).toBe("generating");
+        expect(nextIteration.lastValidationIssues).toEqual([
+          "Reviewer revision brief: 重写标题和开头，减少口语化表达。",
+        ]);
+      }),
+    );
+  });
+
+  it("resets retryCount after a successful completion so future failures can recover normally", async () => {
+    await runWithWorkflowStateManager(
+      Effect.gen(function* () {
+        const manager = yield* WorkflowStateManager;
+        const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
+        const stateFilePath = join(rootDirectory, "state.json");
+        const artifactPath = join(rootDirectory, "artifact.md");
+
+        yield* manager.initializeSession({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          artifactPath,
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          nextStage: "generating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          nextStage: "executing",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          nextStage: "validating",
+        });
+
+        const failed = yield* manager.markFailure({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          message: "first failure",
+        });
+        expect(failed.retryCount).toBe(1);
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          nextStage: "executing",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          nextStage: "validating",
+        });
+
+        const complete = yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          nextStage: "complete",
+        });
+        expect(complete.retryCount).toBe(0);
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          nextStage: "generating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          nextStage: "executing",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          nextStage: "validating",
+        });
+
+        const failedAgain = yield* manager.markFailure({
+          stateFilePath,
+          sessionId: "session-retry-reset",
+          message: "second failure",
+        });
+        expect(failedAgain.retryCount).toBe(1);
+
+        const recovery = yield* manager.recoverSession(stateFilePath, "session-retry-reset");
+        expect(recovery.action).toBe("resume");
+        if (recovery.action === "resume") {
+          expect(recovery.nextStage).toBe("executing");
           expect(recovery.state.retryCount).toBe(1);
         }
       }),

@@ -1,7 +1,7 @@
 import { Effect, Layer, ServiceMap } from "effect";
-import { type ConversationTurn, type ExtractedConversation } from "../domain/Session";
-import { DbError, ParseError, SessionNotFoundError } from "../errors/AppError";
-import { SessionStore } from "./SessionStore";
+import { type ConversationTurn, type ExtractedConversation } from "../domain/Session.ts";
+import { DbError, ParseError, SessionNotFoundError } from "../errors/AppError.ts";
+import { SessionStore } from "./SessionStore.ts";
 
 type MessageData = {
   readonly role?: string;

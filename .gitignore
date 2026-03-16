@@ -1,4 +1,5 @@
 .env
+.env.*
 data/
 logs/
 *.log
@@ -7,13 +8,16 @@ logs/
 
 .direnv
 dist
+node_modules
 
 .repo/*
 !.repo/
 !.repo/clone-reference-repos.sh
 
-node_modules
 .lalph
 .specs
-
 .codemogger
+.output
+
+__pycache__/
+*.pyc

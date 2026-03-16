@@ -1,18 +1,21 @@
 import { Effect, Layer, Option } from "effect";
 import { describe, expect, it } from "vitest";
-import type { ExtractedConversation, PromptBundle } from "../src/domain/Session";
-import { PromptComposer } from "../src/services/PromptComposer";
-import { ArtifactValidator } from "../src/services/ArtifactValidator";
-import { SessionMindWorkflow } from "../src/services/SessionMindWorkflow";
-import { SubprocessSpawner } from "../src/services/SubprocessSpawner";
+import type { ArticleStatus } from "../src/domain/Article.ts";
+import type { ExtractedConversation, PromptBundle } from "../src/domain/Session.ts";
+import { SessionMindOutputPaths } from "../src/domain/SubprocessProtocol.ts";
+import { ArtifactValidator } from "../src/services/ArtifactValidator.ts";
+import { SessionMindWorkflow } from "../src/services/SessionMindWorkflow.ts";
+import { SubprocessSpawner } from "../src/services/SubprocessSpawner.ts";
 import {
   WorkflowStateManager,
   type ActiveWorkflowStage,
   type SessionWorkflowState,
   type WorkflowRecovery,
-} from "../src/services/WorkflowStateManager";
-import { WorkflowSessionExtractor } from "../src/services/WorkflowSessionExtractor";
-import { SubprocessError } from "../src/domain/SessionMindErrors";
+} from "../src/services/WorkflowStateManager.ts";
+import { WorkflowSessionExtractor } from "../src/services/WorkflowSessionExtractor.ts";
+import { SubprocessError } from "../src/domain/SessionMindErrors.ts";
+import { WritingBriefComposer } from "../src/services/WritingBriefComposer.ts";
+import { WorkflowReviewer } from "../src/services/WorkflowReviewer.ts";
 
 const extractedConversation: ExtractedConversation = {
   session: {
@@ -46,7 +49,7 @@ const extractedConversation: ExtractedConversation = {
 
 const promptBundle: PromptBundle = {
   topicHint: "Workflow session",
-  prompt: "Write the article.",
+  writingBrief: "Write the article.",
   sourceSessionIds: ["session-1"],
   generatedAt: 4,
   extracted: [extractedConversation],
@@ -61,6 +64,7 @@ type WorkflowHarness = {
     readonly compositions: Array<ReadonlyArray<string>>;
     readonly spawns: Array<string>;
     readonly validations: Array<string>;
+    readonly reviews: Array<string>;
   };
   readonly layer: Layer.Layer<SessionMindWorkflow>;
 };
@@ -68,10 +72,13 @@ type WorkflowHarness = {
 const createState = (
   stage: SessionWorkflowState["stage"],
   lastStableStage: ActiveWorkflowStage | undefined = "extracting",
+  articleStatus: ArticleStatus = "draft",
 ): SessionWorkflowState => ({
   sessionId: "session-1",
   stage,
-  artifactPath: "/tmp/.output/session-mind/articles/session-1.md",
+  articleStatus,
+  artifactPath: `/tmp/.output/session-mind/${SessionMindOutputPaths.draftsDirectory}/session-1.md`,
+  iteration: 1,
   updatedAt: 10,
   retryCount: stage === "failed" ? 1 : 0,
   ...(lastStableStage !== undefined ? { lastStableStage } : {}),
@@ -82,6 +89,9 @@ const createState = (
 const createHarness = (options?: {
   readonly recovery?: WorkflowRecovery;
   readonly spawnError?: SubprocessError;
+  readonly reviewOutcomes?: ReadonlyArray<
+    { readonly status: "completed" } | { readonly status: "revise"; readonly revisionBrief: string }
+  >;
 }): WorkflowHarness => {
   const calls = {
     initialize: [] as Array<string>,
@@ -91,6 +101,7 @@ const createHarness = (options?: {
     compositions: [] as Array<ReadonlyArray<string>>,
     spawns: [] as Array<string>,
     validations: [] as Array<string>,
+    reviews: [] as Array<string>,
   };
 
   const extractorLayer = Layer.succeed(
@@ -104,8 +115,8 @@ const createHarness = (options?: {
   );
 
   const composerLayer = Layer.succeed(
-    PromptComposer,
-    PromptComposer.of({
+    WritingBriefComposer,
+    WritingBriefComposer.of({
       compose: (extracted) => {
         calls.compositions.push(extracted.map((item) => item.session.id));
         return Effect.succeed(promptBundle);
@@ -124,7 +135,7 @@ const createHarness = (options?: {
 
         return Effect.succeed({
           sessionId,
-          artifactPath: "/tmp/.output/session-mind/articles/session-1.md",
+          artifactPath: `/tmp/.output/session-mind/${SessionMindOutputPaths.draftsDirectory}/session-1.md`,
           promptBundlePath: "/tmp/.output/session-mind/bundles/session-1.prompt.json",
           exitCode: 0,
           stdout: "ok",
@@ -149,7 +160,7 @@ const createHarness = (options?: {
     }),
   );
 
-  const recovery = options?.recovery ?? { action: "start" } satisfies WorkflowRecovery;
+  const recovery = options?.recovery ?? ({ action: "start" } satisfies WorkflowRecovery);
 
   const stateLayer = Layer.succeed(
     WorkflowStateManager,
@@ -162,30 +173,59 @@ const createHarness = (options?: {
           sessionId,
           stage: "extracting",
           artifactPath,
+          articleStatus: "draft" as const,
+          iteration: 1,
           updatedAt: 1,
           retryCount: 0,
           lastStableStage: "extracting",
         });
       },
-      transition: ({ nextStage, artifactPath, promptBundlePath }) => {
+      transition: ({
+        nextStage,
+        artifactPath,
+        promptBundlePath,
+        iteration,
+        lastValidationIssues,
+      }) => {
         calls.transitions.push(nextStage);
         return Effect.succeed({
           sessionId: "session-1",
           stage: nextStage,
-          artifactPath: artifactPath ?? "/tmp/.output/session-mind/articles/session-1.md",
+          articleStatus: "draft" as const,
+          artifactPath:
+            artifactPath ??
+            `/tmp/.output/session-mind/${SessionMindOutputPaths.draftsDirectory}/session-1.md`,
+          iteration: iteration ?? 1,
           updatedAt: 2,
           retryCount: 0,
           ...(nextStage !== "complete" && nextStage !== "failed"
             ? { lastStableStage: nextStage }
             : { lastStableStage: "validating" as const }),
           ...(promptBundlePath !== undefined ? { promptBundlePath } : {}),
+          ...(lastValidationIssues !== undefined ? { lastValidationIssues } : {}),
         });
       },
       markFailure: ({ message }) => {
         calls.failures.push(message);
         return Effect.succeed(createState("failed", "executing"));
       },
+      setArticleStatus: ({ articleStatus, artifactPath }) =>
+        Effect.succeed({
+          ...createState("complete", "validating", articleStatus),
+          artifactPath,
+        }),
       recoverSession: () => Effect.succeed(recovery),
+    }),
+  );
+
+  const reviewerLayer = Layer.succeed(
+    WorkflowReviewer,
+    WorkflowReviewer.of({
+      review: ({ artifactPath }) => {
+        calls.reviews.push(artifactPath);
+        const nextOutcome = options?.reviewOutcomes?.at(calls.reviews.length - 1);
+        return Effect.succeed(nextOutcome ?? { status: "completed" as const });
+      },
     }),
   );
 
@@ -199,6 +239,7 @@ const createHarness = (options?: {
           spawnerLayer,
           validatorLayer,
           stateLayer,
+          reviewerLayer,
         ),
       ),
     ),
@@ -229,27 +270,29 @@ describe("SessionMindWorkflow", () => {
     expect(harness.calls.compositions).toEqual([["session-1"]]);
     expect(harness.calls.spawns).toEqual(["session-1"]);
     expect(harness.calls.validations).toEqual([
-      "/tmp/.output/session-mind/articles/session-1.md",
+      `/tmp/.output/session-mind/${SessionMindOutputPaths.draftsDirectory}/session-1.md`,
     ]);
     expect(harness.calls.transitions).toEqual([
       "generating",
       "executing",
       "validating",
+      "reviewing",
       "complete",
     ]);
   });
 
-  it("short-circuits when the session is already complete", async () => {
+  it("rejects rerunning write against a published article", async () => {
     const harness = createHarness({
       recovery: {
         action: "complete",
-        state: createState("complete", "validating"),
+        state: createState("complete", "validating", "published"),
       },
     });
 
-    const result = await runWorkflow(harness);
-
-    expect(result.artifactPath).toContain("session-1.md");
+    await expect(runWorkflow(harness)).rejects.toMatchObject({
+      _tag: "ValidationError",
+      code: "ARTIFACT_CHECK_FAILED",
+    });
     expect(harness.calls.initialize).toEqual([]);
     expect(harness.calls.extracts).toEqual([]);
     expect(harness.calls.spawns).toEqual([]);
@@ -291,10 +334,64 @@ describe("SessionMindWorkflow", () => {
     const result = await runWorkflow(harness);
 
     expect(result.subprocess.exitCode).toBe(0);
-    expect(harness.calls.transitions).toEqual(["executing", "validating", "complete"]);
+    expect(harness.calls.transitions).toEqual(["executing", "validating", "reviewing", "complete"]);
     expect(harness.calls.spawns).toEqual(["session-1"]);
     expect(harness.calls.validations).toEqual([
-      "/tmp/.output/session-mind/articles/session-1.md",
+      `/tmp/.output/session-mind/${SessionMindOutputPaths.draftsDirectory}/session-1.md`,
+    ]);
+  });
+
+  it("reopens a completed draft when write runs again", async () => {
+    const harness = createHarness({
+      recovery: {
+        action: "resume",
+        nextStage: "generating",
+        state: createState("complete", "validating", "draft"),
+      },
+    });
+
+    const result = await runWorkflow(harness);
+
+    expect(result.subprocess.exitCode).toBe(0);
+    expect(harness.calls.transitions).toEqual([
+      "generating",
+      "executing",
+      "validating",
+      "reviewing",
+      "complete",
+    ]);
+  });
+
+  it("re-enters the writer loop when reviewer feedback requests another revision", async () => {
+    const harness = createHarness({
+      reviewOutcomes: [
+        { status: "revise", revisionBrief: "补强问题背景，并把结论改得更像中文文章。" },
+        { status: "completed" },
+      ],
+    });
+
+    const result = await runWorkflow(harness);
+
+    expect(result.subprocess.exitCode).toBe(0);
+    expect(harness.calls.spawns).toEqual(["session-1", "session-1"]);
+    expect(harness.calls.validations).toEqual([
+      `/tmp/.output/session-mind/${SessionMindOutputPaths.draftsDirectory}/session-1.md`,
+      `/tmp/.output/session-mind/${SessionMindOutputPaths.draftsDirectory}/session-1.md`,
+    ]);
+    expect(harness.calls.reviews).toEqual([
+      `/tmp/.output/session-mind/${SessionMindOutputPaths.draftsDirectory}/session-1.md`,
+      `/tmp/.output/session-mind/${SessionMindOutputPaths.draftsDirectory}/session-1.md`,
+    ]);
+    expect(harness.calls.transitions).toEqual([
+      "generating",
+      "executing",
+      "validating",
+      "reviewing",
+      "generating",
+      "executing",
+      "validating",
+      "reviewing",
+      "complete",
     ]);
   });
 });

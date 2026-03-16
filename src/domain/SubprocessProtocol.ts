@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 import * as SchemaGetter from "effect/SchemaGetter";
-import { PromptBundleSchema, type PromptBundle } from "./Session";
+import { parseSessionIdentifier } from "./Session.ts";
+import { PromptBundleSchema, type PromptBundle } from "./Session.ts";
 
 export const SubprocessEnvironmentVariable = {
   promptBundle: "SESSION_MIND_PROMPT_BUNDLE",
@@ -186,7 +187,10 @@ export const SubprocessProtocol = {
 export const resolveSubprocessArtifactPath = (
   outputDir: string,
   sessionId: string,
-): `${string}/${string}.md` => `${outputDir.replace(/\/+$/, "")}/${sessionId}.md`;
+): `${string}/${string}.md` => {
+  const identifier = parseSessionIdentifier(sessionId);
+  return `${outputDir.replace(/\/+$/, "")}/${SessionMindOutputPaths.draftsDirectory}/${identifier.source}/${identifier.nativeId}.md`;
+};
 export const SessionMindEnvironmentVariables = {
   promptBundle: "SESSION_MIND_PROMPT_BUNDLE",
   outputDir: "SESSION_MIND_OUTPUT_DIR",
@@ -205,7 +209,9 @@ export type SessionMindExitCode = (typeof SessionMindExitCodes)[keyof typeof Ses
 
 export const SessionMindOutputPaths = {
   workflowRoot: ".output/session-mind",
-  articlesDirectory: "articles",
+  draftsDirectory: "drafts",
+  publishedDirectory: "published",
+  articlesDirectory: "drafts",
   bundlesDirectory: "bundles",
   stateFile: "state.json",
 } as const;

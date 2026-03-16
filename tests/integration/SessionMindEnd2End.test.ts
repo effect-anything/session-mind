@@ -4,21 +4,25 @@ import { join } from "node:path";
 import { Effect, Layer } from "effect";
 import * as Schema from "effect/Schema";
 import { afterEach, describe, expect, it } from "vitest";
-import { ExtractedConversationSchema, type ExtractedConversation } from "../../src/domain/Session";
-import { ExtractionError, type SessionMindError } from "../../src/domain/SessionMindErrors";
+import {
+  ExtractedConversationSchema,
+  type ExtractedConversation,
+} from "../../src/domain/Session.ts";
+import { ExtractionError, type SessionMindError } from "../../src/domain/SessionMindErrors.ts";
 import {
   SessionMindEnvironmentVariables,
   SessionMindOutputPaths,
-} from "../../src/domain/SubprocessProtocol";
+} from "../../src/domain/SubprocessProtocol.ts";
 import {
   SessionMindWorkflow,
   type RunWorkflowRequest,
-} from "../../src/services/SessionMindWorkflow";
-import { ArtifactValidator } from "../../src/services/ArtifactValidator";
-import { PromptComposer } from "../../src/services/PromptComposer";
-import { SubprocessSpawner } from "../../src/services/SubprocessSpawner";
-import { WorkflowStateManager } from "../../src/services/WorkflowStateManager";
-import { WorkflowSessionExtractor } from "../../src/services/WorkflowSessionExtractor";
+} from "../../src/services/SessionMindWorkflow.ts";
+import { ArtifactValidator } from "../../src/services/ArtifactValidator.ts";
+import { SubprocessSpawner } from "../../src/services/SubprocessSpawner.ts";
+import { WorkflowStateManager } from "../../src/services/WorkflowStateManager.ts";
+import { WorkflowSessionExtractor } from "../../src/services/WorkflowSessionExtractor.ts";
+import { WorkflowReviewer } from "../../src/services/WorkflowReviewer.ts";
+import { WritingBriefComposer } from "../../src/services/WritingBriefComposer.ts";
 
 const tempDirectories: Array<string> = [];
 const decodeExtractedConversation = Schema.decodeUnknownEffect(ExtractedConversationSchema);
@@ -92,7 +96,7 @@ const buildSuccessfulWriterScript = (delayMs = 0): string =>
     `const bundle = JSON.parse(process.env.${SessionMindEnvironmentVariables.promptBundle});`,
     `const outputDir = process.env.${SessionMindEnvironmentVariables.outputDir};`,
     `const sessionId = process.env.${SessionMindEnvironmentVariables.sessionId};`,
-    "const artifactPath = path.join(outputDir, 'articles', `${sessionId}.md`);",
+    `const artifactPath = path.join(outputDir, '${SessionMindOutputPaths.draftsDirectory}', 'opencode', sessionId + '.md');`,
     "const article = [",
     "  `# ${bundle.topicHint}`,",
     "  '',",
@@ -117,10 +121,42 @@ const buildTooShortWriterScript = (): string =>
     "const path = require('node:path');",
     `const outputDir = process.env.${SessionMindEnvironmentVariables.outputDir};`,
     `const sessionId = process.env.${SessionMindEnvironmentVariables.sessionId};`,
-    "const artifactPath = path.join(outputDir, 'articles', `${sessionId}.md`);",
+    `const artifactPath = path.join(outputDir, '${SessionMindOutputPaths.draftsDirectory}', 'opencode', sessionId + '.md');`,
     "fs.mkdirSync(path.dirname(artifactPath), { recursive: true });",
     "fs.writeFileSync(artifactPath, '# short\\n\\nToo short.', 'utf8');",
     "process.stdout.write(`short-artifact:${sessionId}`);",
+  ].join("\n");
+
+const buildRetryThenSuccessWriterScript = (): string =>
+  [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    `const bundle = JSON.parse(process.env.${SessionMindEnvironmentVariables.promptBundle});`,
+    `const outputDir = process.env.${SessionMindEnvironmentVariables.outputDir};`,
+    `const sessionId = process.env.${SessionMindEnvironmentVariables.sessionId};`,
+    `const artifactPath = path.join(outputDir, '${SessionMindOutputPaths.draftsDirectory}', 'opencode', sessionId + '.md');`,
+    "const attemptFile = path.join(outputDir, `${sessionId}.attempt`);",
+    "const attempt = fs.existsSync(attemptFile) ? Number(fs.readFileSync(attemptFile, 'utf8')) + 1 : 1;",
+    "fs.writeFileSync(attemptFile, String(attempt), 'utf8');",
+    "fs.mkdirSync(path.dirname(artifactPath), { recursive: true });",
+    "if (attempt === 1) {",
+    "  fs.writeFileSync(artifactPath, '# short\\n\\nToo short.', 'utf8');",
+    "  process.stdout.write(`short-artifact:${sessionId}:attempt-${attempt}`);",
+    "} else {",
+    "  const article = [",
+    "    `# ${bundle.topicHint}`,",
+    "    '',",
+    "    `Recovered on attempt ${attempt}` ,",
+    "    '',",
+    "    ...bundle.extracted.flatMap((conversation) =>",
+    "      conversation.turns.map((turn) => `${turn.role.toUpperCase()}: ${turn.content}`),",
+    "    ),",
+    "    '',",
+    "    'This generated article body is intentionally long enough to satisfy artifact validation. '.repeat(5),",
+    "  ].join('\\n');",
+    "  fs.writeFileSync(artifactPath, article, 'utf8');",
+    "  process.stdout.write(`artifact-written:${sessionId}:attempt-${attempt}`);",
+    "}",
   ].join("\n");
 
 const buildFailureScript = (message: string): string =>
@@ -171,10 +207,16 @@ const createWorkflowLayer = (sessionsDirectory: string): Layer.Layer<SessionMind
     Layer.provide(
       Layer.mergeAll(
         extractorLayer,
-        PromptComposer.layer,
+        WritingBriefComposer.layer,
         SubprocessSpawner.layer,
         ArtifactValidator.layer,
         WorkflowStateManager.layer,
+        Layer.succeed(
+          WorkflowReviewer,
+          WorkflowReviewer.of({
+            review: () => Effect.succeed({ status: "completed" as const }),
+          }),
+        ),
       ),
     ),
   );
@@ -202,6 +244,7 @@ const readWorkflowState = async (workdir: string) =>
       string,
       {
         readonly stage: string;
+        readonly iteration: number;
         readonly retryCount: number;
         readonly lastError?: string;
         readonly promptBundlePath?: string;
@@ -295,6 +338,7 @@ describe("SessionMind end-to-end integration", () => {
         args: [scriptPath],
         cwd: workdir,
         workdir,
+        maxIterations: 2,
       }),
     ).rejects.toMatchObject({
       _tag: "ValidationError",
@@ -305,16 +349,16 @@ describe("SessionMind end-to-end integration", () => {
 
     expect(state.sessions[sessionId]).toMatchObject({
       stage: "failed",
+      iteration: 2,
       retryCount: 1,
     });
     expect(state.sessions[sessionId]?.lastError).toContain("at least");
   });
 
-  it("re-runs generation after a validation failure so a fresh artifact can complete", async () => {
+  it("re-runs generation inside one workflow run after a validation failure so a fresh artifact can complete", async () => {
     const workdir = await createTempDirectory();
     const sessionsDirectory = join(workdir, "mock-sessions");
     const sessionId = "session-validation-retry";
-    const layer = createWorkflowLayer(sessionsDirectory);
 
     await createMockSessionFile(
       sessionsDirectory,
@@ -330,54 +374,32 @@ describe("SessionMind end-to-end integration", () => {
       ]),
     );
 
-    const shortScriptPath = await createSubprocessScript(
+    const retryScriptPath = await createSubprocessScript(
       workdir,
-      "write-short-retry",
-      buildTooShortWriterScript(),
+      "write-retry-then-success",
+      buildRetryThenSuccessWriterScript(),
     );
 
-    await expect(
-      runWorkflow(layer, {
-        sessionId,
-        command: process.execPath,
-        args: [shortScriptPath],
-        cwd: workdir,
-        workdir,
-      }),
-    ).rejects.toMatchObject({
-      _tag: "ValidationError",
-      code: "ARTIFACT_TOO_SHORT",
-    } satisfies Partial<SessionMindError>);
-
-    const failedState = await readWorkflowState(workdir);
-    expect(failedState.sessions[sessionId]).toMatchObject({
-      stage: "failed",
-      retryCount: 1,
-    });
-
-    const successfulScriptPath = await createSubprocessScript(
-      workdir,
-      "write-valid-retry",
-      buildSuccessfulWriterScript(),
-    );
-
-    const recovered = await runWorkflow(layer, {
+    const recovered = await runWorkflow(createWorkflowLayer(sessionsDirectory), {
       sessionId,
       command: process.execPath,
-      args: [successfulScriptPath],
+      args: [retryScriptPath],
       cwd: workdir,
       workdir,
+      maxIterations: 3,
     });
 
     const recoveredArtifact = await readFile(recovered.artifactPath, "utf8");
     const finalState = await readWorkflowState(workdir);
 
-    expect(recovered.subprocess.stdout).toContain(`artifact-written:${sessionId}`);
+    expect(recovered.subprocess.stdout).toContain(`artifact-written:${sessionId}:attempt-2`);
     expect(recoveredArtifact).toContain("# Validation retry workflow");
+    expect(recoveredArtifact).toContain("Recovered on attempt 2");
     expect(recoveredArtifact.length).toBeGreaterThan(200);
     expect(finalState.sessions[sessionId]).toMatchObject({
       stage: "complete",
-      retryCount: 1,
+      iteration: 2,
+      retryCount: 0,
     });
   });
 
@@ -447,7 +469,7 @@ describe("SessionMind end-to-end integration", () => {
     expect(recoveredArtifact).toContain("# Recovery workflow");
     expect(finalState.sessions[sessionId]).toMatchObject({
       stage: "complete",
-      retryCount: 1,
+      retryCount: 0,
     });
   });
 

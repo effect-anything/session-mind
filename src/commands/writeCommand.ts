@@ -1,14 +1,22 @@
 import { readFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
-import { Data, Effect, Exit, Schema } from "effect";
+import { Data, Effect, Exit, Option, Schema } from "effect";
 import * as Console from "effect/Console";
+import * as Argument from "effect/unstable/cli/Argument";
 import * as Command from "effect/unstable/cli/Command";
 import * as Flag from "effect/unstable/cli/Flag";
+import { parseSessionIdentifier } from "../domain/Session.ts";
+import { SessionMindOutputPaths } from "../domain/SubprocessProtocol.ts";
+import { SessionMindWorkflow } from "../services/SessionMindWorkflow.ts";
 import {
-  SessionMindEnvironmentVariables,
-  SessionMindOutputPaths,
-} from "../domain/SubprocessProtocol";
-import { SessionMindWorkflow } from "../services/SessionMindWorkflow";
+  SessionProviderRegistry,
+  type SessionSourceFilter,
+} from "../services/SessionProviderRegistry.ts";
+import { WorkflowStateManager } from "../services/WorkflowStateManager.ts";
+import {
+  AgentResultPathPlaceholder,
+  WriterPromptArgumentPlaceholder,
+} from "../services/WriterTaskBuilder.ts";
 
 class WriteCommandError extends Data.TaggedError("WriteCommandError")<{
   readonly message: string;
@@ -62,19 +70,22 @@ const presetsConfigPath = (cwd: string) =>
 
 const defaultOutputDir = join(process.cwd(), SessionMindOutputPaths.workflowRoot);
 const defaultTimeoutSeconds = 30 * 60;
+const workflowStateFilePathFor = (outputDir: string) =>
+  join(outputDir, SessionMindOutputPaths.stateFile);
+const sessionIdArgument = Argument.string("session-id").pipe(
+  Argument.withDescription("Session id to run through the workflow. Use source:id to be explicit."),
+  Argument.optional,
+);
 
-const writeAgentPrompt = [
-  "You are the session-mind writing subprocess.",
-  "Do not ask follow-up questions and do not wait for interactive input.",
-  `Read the prompt bundle from ${SessionMindEnvironmentVariables.promptBundle}.`,
-  "If that environment variable contains a filesystem path, read the JSON file at that path.",
-  "If it contains JSON directly, parse the JSON payload from the variable value.",
-  `Use ${SessionMindEnvironmentVariables.outputDir} as the workflow output root.`,
-  `Write the final markdown article to ${SessionMindEnvironmentVariables.outputDir}/articles/${SessionMindEnvironmentVariables.sessionId}.md.`,
-  "Only write the final article markdown to that file.",
-  "Exit with code 0 after the file is written successfully.",
-  "If the article cannot be produced, write diagnostics to stderr and exit with code 3.",
-].join("\n");
+type ResolvedSessionInput = {
+  readonly sessionId: string;
+  readonly message?: string;
+};
+
+const makeResolvedSessionInput = (sessionId: string, message?: string): ResolvedSessionInput => ({
+  sessionId,
+  ...(message !== undefined ? { message } : {}),
+});
 
 const unwrapSingleSessionId = (
   metadata: SessionFileMetadata,
@@ -146,46 +157,170 @@ const resolveSessionId = Effect.fn("writeCommand.resolveSessionId")(function* (
   });
 });
 
-const resolveCliAgentPresets = Effect.fn("writeCommand.resolveCliAgentPresets")(
-  function* (cwd: string) {
-    const filePath = presetsConfigPath(cwd);
-    const rawPresets = yield* Effect.tryPromise({
-      try: async () => {
-        try {
-          return await readFile(filePath, "utf8");
-        } catch (cause) {
-          if (
-            typeof cause === "object" &&
-            cause !== null &&
-            "code" in cause &&
-            cause.code === "ENOENT"
-          ) {
-            return null;
-          }
+const resolveRequestedSessionId = Effect.fn("writeCommand.resolveRequestedSessionId")(function* ({
+  sessionId,
+  sessionFile,
+  latest,
+  resumeLatest,
+  source,
+  outputDir,
+}: {
+  readonly sessionId: Option.Option<string>;
+  readonly sessionFile: Option.Option<string>;
+  readonly latest: boolean;
+  readonly resumeLatest: boolean;
+  readonly source: SessionSourceFilter;
+  readonly outputDir: string;
+}) {
+  const providedInputCount =
+    Number(Option.isSome(sessionId)) +
+    Number(Option.isSome(sessionFile)) +
+    Number(latest) +
+    Number(resumeLatest);
 
-          throw cause;
-        }
-      },
-      catch: (cause) =>
-        new WriteCommandError({
-          message: `Failed to read preset configuration ${filePath}: ${String(cause)}`,
-        }),
+  if (providedInputCount > 1) {
+    return yield* new WriteCommandError({
+      message:
+        "Pass only one session selector: a positional session id, --session-file, --latest, or --resume-latest.",
     });
+  }
 
-    if (rawPresets === null) {
-      return [defaultPreset] as const;
-    }
+  const providers = yield* SessionProviderRegistry;
+  const stateManager = yield* WorkflowStateManager;
+  const effectiveSource =
+    Option.isSome(sessionId) && sessionId.value.includes(":")
+      ? parseSessionIdentifier(sessionId.value).source
+      : source;
 
-    return yield* decodePresets(rawPresets).pipe(
+  if (Option.isSome(sessionId)) {
+    return yield* providers.resolveSession(sessionId.value, effectiveSource).pipe(
+      Effect.map((resolved) => makeResolvedSessionInput(resolved.id)),
       Effect.mapError(
         (cause) =>
           new WriteCommandError({
-            message: `Failed to decode preset configuration ${filePath}: ${String(cause)}`,
+            message: cause.message,
           }),
       ),
     );
-  },
-);
+  }
+
+  if (Option.isSome(sessionFile)) {
+    const resolvedFromFile = yield* resolveSessionId(sessionFile.value);
+    return yield* providers.resolveSession(resolvedFromFile, source).pipe(
+      Effect.map((resolved) => makeResolvedSessionInput(resolved.id)),
+      Effect.mapError(
+        (cause) =>
+          new WriteCommandError({
+            message: cause.message,
+          }),
+      ),
+    );
+  }
+
+  const resolveLatestSession = (
+    selection: "latest" | "resume-latest",
+  ): Effect.Effect<ResolvedSessionInput, WriteCommandError> =>
+    Effect.gen(function* () {
+      const sessions = yield* providers.listRecent(1, effectiveSource).pipe(
+        Effect.mapError(
+          (cause) =>
+            new WriteCommandError({
+              message: `Failed to load recent sessions: ${String(cause)}`,
+            }),
+        ),
+      );
+      const currentSession = sessions[0];
+
+      if (currentSession === undefined) {
+        return yield* new WriteCommandError({
+          message:
+            "No sessions were found. Pass a positional session id or --session-file after creating at least one session.",
+        });
+      }
+
+      return makeResolvedSessionInput(
+        currentSession.id,
+        selection === "latest"
+          ? `Auto-selected most recent ${currentSession.source} session ${currentSession.id} (${currentSession.title})`
+          : `No reusable draft workflow was found. Falling back to the most recent ${currentSession.source} session ${currentSession.id} (${currentSession.title})`,
+      );
+    });
+
+  if (resumeLatest || providedInputCount === 0) {
+    const workflowState = yield* stateManager.readState(workflowStateFilePathFor(outputDir)).pipe(
+      Effect.mapError(
+        (cause) =>
+          new WriteCommandError({
+            message: `Failed to read workflow state from ${workflowStateFilePathFor(outputDir)}: ${String(cause)}`,
+          }),
+      ),
+    );
+    const latestDraftSession = Object.values(workflowState.sessions)
+      .filter(
+        (state) =>
+          state.articleStatus === "draft" &&
+          (effectiveSource === "all" ||
+            parseSessionIdentifier(state.sessionId).source === effectiveSource),
+      )
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+
+    if (latestDraftSession !== undefined) {
+      return makeResolvedSessionInput(
+        latestDraftSession.sessionId,
+        `Auto-selected draft workflow session ${latestDraftSession.sessionId} from stage ${latestDraftSession.stage}`,
+      );
+    }
+
+    return yield* resolveLatestSession("resume-latest");
+  }
+
+  if (latest) {
+    return yield* resolveLatestSession("latest");
+  }
+
+  return yield* resolveLatestSession("resume-latest");
+});
+
+const resolveCliAgentPresets = Effect.fn("writeCommand.resolveCliAgentPresets")(function* (
+  cwd: string,
+) {
+  const filePath = presetsConfigPath(cwd);
+  const rawPresets = yield* Effect.tryPromise({
+    try: async () => {
+      try {
+        return await readFile(filePath, "utf8");
+      } catch (cause) {
+        if (
+          typeof cause === "object" &&
+          cause !== null &&
+          "code" in cause &&
+          cause.code === "ENOENT"
+        ) {
+          return null;
+        }
+
+        throw cause;
+      }
+    },
+    catch: (cause) =>
+      new WriteCommandError({
+        message: `Failed to read preset configuration ${filePath}: ${String(cause)}`,
+      }),
+  });
+
+  if (rawPresets === null) {
+    return [defaultPreset] as const;
+  }
+
+  return yield* decodePresets(rawPresets).pipe(
+    Effect.mapError(
+      (cause) =>
+        new WriteCommandError({
+          message: `Failed to decode preset configuration ${filePath}: ${String(cause)}`,
+        }),
+    ),
+  );
+});
 
 const resolvePreset = Effect.fn("writeCommand.resolvePreset")(function* (
   cwd: string,
@@ -222,6 +357,7 @@ const applyCommandPrefix = (
 
 const buildAgentInvocation = (
   preset: CliAgentPreset,
+  mode: "interactive" | "non-interactive" = "interactive",
 ): Effect.Effect<
   {
     readonly command: string;
@@ -234,27 +370,34 @@ const buildAgentInvocation = (
       case "amp":
         return {
           command: "amp",
-          args: ["--dangerously-allow-all", ...preset.extraArgs, writeAgentPrompt],
+          args: ["--dangerously-allow-all", ...preset.extraArgs, WriterPromptArgumentPlaceholder],
         } as const;
       case "claude":
         return {
           command: "claude",
-          args: ["--dangerously-skip-permissions", ...preset.extraArgs, writeAgentPrompt],
+          args: [
+            "--dangerously-skip-permissions",
+            ...preset.extraArgs,
+            WriterPromptArgumentPlaceholder,
+          ],
         } as const;
       case "codex":
         return {
           command: "codex",
           args: [
-            "exec",
+            ...(mode === "non-interactive" ? ["exec"] : []),
             "--dangerously-bypass-approvals-and-sandbox",
             ...preset.extraArgs,
-            writeAgentPrompt,
+            ...(mode === "non-interactive"
+              ? ["--output-last-message", AgentResultPathPlaceholder]
+              : []),
+            WriterPromptArgumentPlaceholder,
           ],
         } as const;
       case "opencode":
         return {
           command: "opencode",
-          args: ["run", writeAgentPrompt, "--thinking", ...preset.extraArgs],
+          args: ["run", WriterPromptArgumentPlaceholder, "--thinking", ...preset.extraArgs],
         } as const;
       case "clanka":
         return null;
@@ -275,10 +418,24 @@ const buildAgentInvocation = (
 export const writeCommand = Command.make(
   "write",
   {
+    sessionId: sessionIdArgument,
     sessionFile: Flag.file("session-file", { mustExist: true }).pipe(
       Flag.withDescription(
-        "Path to an exported session JSON file or a file containing a single session id",
+        "Optional legacy input: exported session JSON file or a file containing a single session id",
       ),
+      Flag.optional,
+    ),
+    latest: Flag.boolean("latest").pipe(
+      Flag.withDescription("Use the most recent session instead of passing a session id"),
+    ),
+    resumeLatest: Flag.boolean("resume-latest").pipe(
+      Flag.withDescription(
+        "Prefer the most recently updated draft workflow session, then fall back to the most recent session",
+      ),
+    ),
+    source: Flag.string("source").pipe(
+      Flag.withDefault("all"),
+      Flag.withDescription("Session source: all, opencode, codex, or claude"),
     ),
     outputDir: Flag.directory("output-dir").pipe(
       Flag.withDefault(defaultOutputDir),
@@ -290,47 +447,91 @@ export const writeCommand = Command.make(
       Flag.withDefault(defaultTimeoutSeconds),
       Flag.withDescription("Subprocess timeout in seconds"),
     ),
+    maxIterations: Flag.integer("max-iterations").pipe(
+      Flag.withDefault(3),
+      Flag.withDescription("Maximum writer iterations before the workflow fails"),
+    ),
     agentPreset: Flag.string("agent-preset").pipe(
       Flag.withDefault("default"),
-      Flag.withDescription(
-        "Lalph CLI agent preset id used to choose the downstream writing agent",
-      ),
+      Flag.withDescription("Lalph CLI agent preset id used to choose the downstream writing agent"),
     ),
   },
-  ({ sessionFile, outputDir, timeout, agentPreset }) =>
+  ({
+    sessionId,
+    sessionFile,
+    latest,
+    resumeLatest,
+    source,
+    outputDir,
+    timeout,
+    maxIterations,
+    agentPreset,
+  }) =>
     Effect.gen(function* () {
       const workflow = yield* SessionMindWorkflow;
       const cwd = process.cwd();
-      const sessionId = yield* resolveSessionId(sessionFile);
-      const preset = yield* resolvePreset(cwd, agentPreset);
-      const invocation = yield* buildAgentInvocation(preset);
-      const result = yield* workflow.run({
+      const resolvedSession = yield* resolveRequestedSessionId({
         sessionId,
+        sessionFile,
+        latest,
+        resumeLatest,
+        source: source as SessionSourceFilter,
+        outputDir,
+      });
+      if (resolvedSession.message !== undefined) {
+        yield* Console.log(resolvedSession.message);
+      }
+      const preset = yield* resolvePreset(cwd, agentPreset);
+      const invocation = yield* buildAgentInvocation(preset, "interactive");
+      const reviewInvocation = yield* buildAgentInvocation(preset, "non-interactive");
+      const result = yield* workflow.run({
+        sessionId: resolvedSession.sessionId,
         command: invocation.command,
         args: invocation.args,
+        reviewCommand: reviewInvocation.command,
+        reviewArgs: reviewInvocation.args,
         workdir: cwd,
         cwd,
         outputDir,
         timeoutMs: timeout * 1_000,
+        stdioMode: "foreground",
+        maxIterations,
       });
 
       yield* Console.log(
-        `Generated article for ${result.sessionId} at ${result.artifactPath} using preset ${preset.id}`,
+        `Generated draft article for ${result.sessionId} at ${result.artifactPath} using preset ${preset.id}`,
       );
     }),
 ).pipe(
   Command.withDescription(
-    "Run the session-mind workflow for one session file and spawn a downstream writing agent",
+    "Run the full article-writing workflow for one session and spawn a downstream writing agent",
   ),
   Command.withExamples([
     {
-      command: "session-article write --session-file ./session-123.json",
-      description: "Resolve a session id from an exported session file and generate an article",
+      command: "session-mind write session-123",
+      description: "Run the full workflow directly from an OpenCode session id",
+    },
+    {
+      command: "session-mind write",
+      description:
+        "Continue the most recent draft workflow session, or fall back to the most recent session across all providers",
+    },
+    {
+      command: "session-mind write --latest",
+      description: "Start from the most recent session without copying its session id",
+    },
+    {
+      command: "session-mind write --source claude --latest",
+      description: "Start from the most recent Claude session",
     },
     {
       command:
-        "session-article write --session-file ./session-id.txt --agent-preset opencode --output-dir ./.output/session-mind --timeout 900",
+        "session-mind write session-123 --agent-preset opencode --output-dir ./.output/session-mind --timeout 900 --max-iterations 4",
       description: "Use a specific writing-agent preset and custom workflow output directory",
+    },
+    {
+      command: "session-mind write --session-file ./session-123.json",
+      description: "Resolve a session id from a legacy exported session file",
     },
   ]),
 );
