@@ -1,9 +1,8 @@
-import { describe, expect, layer } from "@effect/vitest";
 import { Effect, Exit, Option } from "effect";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { WorkflowStateManager } from "../src/services/WorkflowStateManager";
 
 const tempDirectories: Array<string> = [];
@@ -14,6 +13,10 @@ const createTempDirectory = async () => {
   return directory;
 };
 
+const runWithWorkflowStateManager = <A, E>(
+  effect: Effect.Effect<A, E, WorkflowStateManager>,
+): Promise<A> => Effect.runPromise(effect.pipe(Effect.provide(WorkflowStateManager.layer)));
+
 afterEach(async () => {
   await Promise.all(
     tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
@@ -21,10 +24,9 @@ afterEach(async () => {
 });
 
 describe("WorkflowStateManager", () => {
-  layer(WorkflowStateManager.layer)((it) => {
-    it.effect(
-      "persists workflow transitions atomically to the state file",
-      Effect.fn(function* () {
+  it("persists workflow transitions atomically to the state file", async () => {
+    await runWithWorkflowStateManager(
+      Effect.gen(function* () {
         const manager = yield* WorkflowStateManager;
         const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
         const stateFilePath = join(rootDirectory, "state.json");
@@ -70,10 +72,11 @@ describe("WorkflowStateManager", () => {
         expect(stateFileContent).not.toContain(".tmp");
       }),
     );
+  });
 
-    it.effect(
-      "rejects invalid workflow transitions",
-      Effect.fn(function* () {
+  it("rejects invalid workflow transitions", async () => {
+    await runWithWorkflowStateManager(
+      Effect.gen(function* () {
         const manager = yield* WorkflowStateManager;
         const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
         const stateFilePath = join(rootDirectory, "state.json");
@@ -98,16 +101,18 @@ describe("WorkflowStateManager", () => {
           const failure = Exit.findErrorOption(exit);
           expect(Option.isSome(failure)).toBe(true);
           if (Option.isSome(failure)) {
-            expect(failure.value._tag).toBe("StateError");
-            expect(failure.value.code).toBe("STATE_TRANSITION_INVALID");
+            const error = failure.value as { readonly _tag: string; readonly code: string };
+            expect(error._tag).toBe("StateError");
+            expect(error.code).toBe("STATE_TRANSITION_INVALID");
           }
         }
       }),
     );
+  });
 
-    it.effect(
-      "recovers resumable workflows from persisted state",
-      Effect.fn(function* () {
+  it("recovers resumable workflows from persisted state", async () => {
+    await runWithWorkflowStateManager(
+      Effect.gen(function* () {
         const manager = yield* WorkflowStateManager;
         const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
         const stateFilePath = join(rootDirectory, "state.json");
@@ -131,6 +136,58 @@ describe("WorkflowStateManager", () => {
         if (recovery.action === "resume") {
           expect(recovery.nextStage).toBe("generating");
           expect(recovery.state.sessionId).toBe("session-3");
+        }
+      }),
+    );
+  });
+
+  it("retries failed validation runs from executing so the artifact can be regenerated", async () => {
+    await runWithWorkflowStateManager(
+      Effect.gen(function* () {
+        const manager = yield* WorkflowStateManager;
+        const rootDirectory = yield* Effect.tryPromise(() => createTempDirectory());
+        const stateFilePath = join(rootDirectory, "state.json");
+        const artifactPath = join(rootDirectory, "artifact.md");
+
+        yield* manager.initializeSession({
+          stateFilePath,
+          sessionId: "session-4",
+          artifactPath,
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-4",
+          nextStage: "generating",
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-4",
+          nextStage: "executing",
+          promptBundlePath: join(rootDirectory, "prompt.json"),
+        });
+
+        yield* manager.transition({
+          stateFilePath,
+          sessionId: "session-4",
+          nextStage: "validating",
+        });
+
+        yield* manager.markFailure({
+          stateFilePath,
+          sessionId: "session-4",
+          message: "Generated artifact was too short",
+        });
+
+        const recovery = yield* manager.recoverSession(stateFilePath, "session-4");
+
+        expect(recovery.action).toBe("resume");
+        if (recovery.action === "resume") {
+          expect(recovery.nextStage).toBe("executing");
+          expect(recovery.state.stage).toBe("failed");
+          expect(recovery.state.lastStableStage).toBe("validating");
+          expect(recovery.state.retryCount).toBe(1);
         }
       }),
     );

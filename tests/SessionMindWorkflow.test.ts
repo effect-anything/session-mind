@@ -279,11 +279,11 @@ describe("SessionMindWorkflow", () => {
     expect(harness.calls.transitions).toEqual(["generating", "executing"]);
   });
 
-  it("resumes from a failed validating state without re-spawning the subprocess", async () => {
+  it("resumes from a failed validating state by re-spawning the subprocess", async () => {
     const harness = createHarness({
       recovery: {
         action: "resume",
-        nextStage: "validating",
+        nextStage: "executing",
         state: createState("failed", "validating"),
       },
     });
@@ -291,8 +291,8 @@ describe("SessionMindWorkflow", () => {
     const result = await runWorkflow(harness);
 
     expect(result.subprocess.exitCode).toBe(0);
-    expect(harness.calls.transitions).toEqual(["validating", "complete"]);
-    expect(harness.calls.spawns).toEqual([]);
+    expect(harness.calls.transitions).toEqual(["executing", "validating", "complete"]);
+    expect(harness.calls.spawns).toEqual(["session-1"]);
     expect(harness.calls.validations).toEqual([
       "/tmp/.output/session-mind/articles/session-1.md",
     ]);

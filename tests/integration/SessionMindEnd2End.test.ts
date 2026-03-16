@@ -310,6 +310,77 @@ describe("SessionMind end-to-end integration", () => {
     expect(state.sessions[sessionId]?.lastError).toContain("at least");
   });
 
+  it("re-runs generation after a validation failure so a fresh artifact can complete", async () => {
+    const workdir = await createTempDirectory();
+    const sessionsDirectory = join(workdir, "mock-sessions");
+    const sessionId = "session-validation-retry";
+    const layer = createWorkflowLayer(sessionsDirectory);
+
+    await createMockSessionFile(
+      sessionsDirectory,
+      createMockConversation(sessionId, "Validation retry workflow", [
+        {
+          role: "user",
+          content: "Retry article generation if the first draft is invalid.",
+        },
+        {
+          role: "assistant",
+          content: "Run the writer again instead of validating the same broken file.",
+        },
+      ]),
+    );
+
+    const shortScriptPath = await createSubprocessScript(
+      workdir,
+      "write-short-retry",
+      buildTooShortWriterScript(),
+    );
+
+    await expect(
+      runWorkflow(layer, {
+        sessionId,
+        command: process.execPath,
+        args: [shortScriptPath],
+        cwd: workdir,
+        workdir,
+      }),
+    ).rejects.toMatchObject({
+      _tag: "ValidationError",
+      code: "ARTIFACT_TOO_SHORT",
+    } satisfies Partial<SessionMindError>);
+
+    const failedState = await readWorkflowState(workdir);
+    expect(failedState.sessions[sessionId]).toMatchObject({
+      stage: "failed",
+      retryCount: 1,
+    });
+
+    const successfulScriptPath = await createSubprocessScript(
+      workdir,
+      "write-valid-retry",
+      buildSuccessfulWriterScript(),
+    );
+
+    const recovered = await runWorkflow(layer, {
+      sessionId,
+      command: process.execPath,
+      args: [successfulScriptPath],
+      cwd: workdir,
+      workdir,
+    });
+
+    const recoveredArtifact = await readFile(recovered.artifactPath, "utf8");
+    const finalState = await readWorkflowState(workdir);
+
+    expect(recovered.subprocess.stdout).toContain(`artifact-written:${sessionId}`);
+    expect(recoveredArtifact).toContain("# Validation retry workflow");
+    expect(recoveredArtifact.length).toBeGreaterThan(200);
+    expect(finalState.sessions[sessionId]).toMatchObject({
+      stage: "complete",
+      retryCount: 1,
+    });
+  });
+
   it("recovers from a failed subprocess run on the next execution", async () => {
     const workdir = await createTempDirectory();
     const sessionsDirectory = join(workdir, "mock-sessions");

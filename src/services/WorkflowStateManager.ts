@@ -98,7 +98,9 @@ const isActiveStage = (stage: WorkflowStage): stage is ActiveWorkflowStage =>
   stage === "validating";
 
 const defaultNextStageForFailure = (state: SessionWorkflowState): ActiveWorkflowStage =>
-  state.lastStableStage ?? "extracting";
+  state.lastStableStage === "validating"
+    ? "executing"
+    : (state.lastStableStage ?? "extracting");
 
 const readStateFile = (stateFilePath: string): Effect.Effect<WorkflowState, StateError> =>
   Effect.tryPromise({
