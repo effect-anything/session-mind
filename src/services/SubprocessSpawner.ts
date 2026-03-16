@@ -1,15 +1,6 @@
 import { NodeServices } from "@effect/platform-node";
 import { join } from "node:path";
-import {
-  Duration,
-  Effect,
-  Fiber,
-  FileSystem,
-  Layer,
-  Ref,
-  ServiceMap,
-  Stream,
-} from "effect";
+import { Duration, Effect, Fiber, FileSystem, Layer, Ref, ServiceMap, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import type { PromptBundle } from "../domain/Session";
 import {
@@ -97,9 +88,7 @@ const withCapturedOutput = (
 export class SubprocessSpawner extends ServiceMap.Service<
   SubprocessSpawner,
   {
-    spawn(
-      request: SpawnSubprocessRequest,
-    ): Effect.Effect<SpawnSubprocessResult, SubprocessError>;
+    spawn(request: SpawnSubprocessRequest): Effect.Effect<SpawnSubprocessResult, SubprocessError>;
   }
 >()("session-mind/SubprocessSpawner") {
   static readonly layer = Layer.effect(
@@ -174,53 +163,51 @@ export class SubprocessSpawner extends ServiceMap.Service<
 
         return yield* Effect.scoped(
           Effect.gen(function* () {
-            const handle = yield* spawner.spawn(
-              ChildProcess.make(command, [...args], {
-                cwd,
-                env: {
-                  ...env,
-                  [SubprocessEnvironmentVariable.promptBundle]: serializedPromptBundle,
-                  [SubprocessEnvironmentVariable.outputDir]: outputDir,
-                  [SubprocessEnvironmentVariable.sessionId]: sessionId,
-                  [SubprocessEnvironmentVariable.timeoutSeconds]: String(
-                    Math.max(1, Math.ceil(timeoutMs / 1000)),
-                  ),
-                },
-                extendEnv: true,
-                stdin: "ignore",
-                stdout: "pipe",
-                stderr: "pipe",
-              }),
-            ).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new SubprocessError({
-                    code: "SUBPROCESS_SPAWN_FAILED",
-                    message: "Failed to start subprocess",
-                    context: buildContext({
-                      ...request,
-                      details: { cause: String(cause) },
+            const handle = yield* spawner
+              .spawn(
+                ChildProcess.make(command, [...args], {
+                  cwd,
+                  env: {
+                    ...env,
+                    [SubprocessEnvironmentVariable.promptBundle]: serializedPromptBundle,
+                    [SubprocessEnvironmentVariable.outputDir]: outputDir,
+                    [SubprocessEnvironmentVariable.sessionId]: sessionId,
+                    [SubprocessEnvironmentVariable.timeoutSeconds]: String(
+                      Math.max(1, Math.ceil(timeoutMs / 1000)),
+                    ),
+                  },
+                  extendEnv: true,
+                  stdin: "ignore",
+                  stdout: "pipe",
+                  stderr: "pipe",
+                }),
+              )
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new SubprocessError({
+                      code: "SUBPROCESS_SPAWN_FAILED",
+                      message: "Failed to start subprocess",
+                      context: buildContext({
+                        ...request,
+                        details: { cause: String(cause) },
+                      }),
                     }),
-                  }),
-              ),
-            );
+                ),
+              );
 
             const stdoutRef = yield* Ref.make("");
             const stderrRef = yield* Ref.make("");
 
             const stdoutFiber = yield* handle.stdout.pipe(
               Stream.decodeText(),
-              Stream.runForEach((chunk) =>
-                Ref.update(stdoutRef, (stdout) => `${stdout}${chunk}`),
-              ),
+              Stream.runForEach((chunk) => Ref.update(stdoutRef, (stdout) => `${stdout}${chunk}`)),
               Effect.forkChild,
             );
 
             const stderrFiber = yield* handle.stderr.pipe(
               Stream.decodeText(),
-              Stream.runForEach((chunk) =>
-                Ref.update(stderrRef, (stderr) => `${stderr}${chunk}`),
-              ),
+              Stream.runForEach((chunk) => Ref.update(stderrRef, (stderr) => `${stderr}${chunk}`)),
               Effect.forkChild,
             );
 
@@ -273,21 +260,23 @@ export class SubprocessSpawner extends ServiceMap.Service<
               Effect.map(Number),
               Effect.timeout(Duration.millis(timeoutMs)),
               Effect.catchTag("TimeoutError", () =>
-                handle.kill({
-                  killSignal: "SIGTERM",
-                  forceKillAfter: killGracePeriod,
-                }).pipe(
-                  Effect.catch(() => Effect.void),
-                  Effect.andThen(
-                    Effect.fail(
-                      new SubprocessError({
-                        code: "SUBPROCESS_TIMED_OUT",
-                        message: "Subprocess exceeded the configured timeout",
-                        context: buildContext(request),
-                      }),
+                handle
+                  .kill({
+                    killSignal: "SIGTERM",
+                    forceKillAfter: killGracePeriod,
+                  })
+                  .pipe(
+                    Effect.catch(() => Effect.void),
+                    Effect.andThen(
+                      Effect.fail(
+                        new SubprocessError({
+                          code: "SUBPROCESS_TIMED_OUT",
+                          message: "Subprocess exceeded the configured timeout",
+                          context: buildContext(request),
+                        }),
+                      ),
                     ),
                   ),
-                ),
               ),
               Effect.mapError((cause) =>
                 isSubprocessError(cause)

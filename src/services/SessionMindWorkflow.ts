@@ -24,6 +24,7 @@ export type RunWorkflowRequest = {
   readonly args?: ReadonlyArray<string>;
   readonly workdir: string;
   readonly cwd?: string;
+  readonly outputDir?: string;
   readonly timeoutMs?: number;
   readonly minimumArtifactLength?: number;
 };
@@ -35,8 +36,11 @@ export type SessionMindWorkflowResult = {
   readonly subprocess: SpawnSubprocessResult;
 };
 
-const workflowPathsFor = (workdir: string, sessionId: string) => {
-  const outputDir = join(workdir, SessionMindOutputPaths.workflowRoot);
+const workflowPathsFor = (
+  workdir: string,
+  sessionId: string,
+  outputDir = join(workdir, SessionMindOutputPaths.workflowRoot),
+) => {
   return {
     outputDir,
     stateFilePath: join(outputDir, SessionMindOutputPaths.stateFile),
@@ -156,10 +160,11 @@ export class SessionMindWorkflow extends ServiceMap.Service<
         args = [],
         workdir,
         cwd = workdir,
+        outputDir,
         timeoutMs,
         minimumArtifactLength,
       }: RunWorkflowRequest) {
-        const paths = workflowPathsFor(workdir, sessionId);
+        const paths = workflowPathsFor(workdir, sessionId, outputDir);
         const recovery = yield* stateManager.recoverSession(paths.stateFilePath, sessionId);
 
         if (recovery.action === "complete") {

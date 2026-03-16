@@ -73,7 +73,9 @@ const spawnSubprocess = (directory: string, args: ReadonlyArray<string>, timeout
   );
 
 afterEach(async () => {
-  await Promise.all(tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+  await Promise.all(
+    tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+  );
 });
 
 describe("SubprocessSpawner", () => {
@@ -102,8 +104,11 @@ describe("SubprocessSpawner", () => {
       join(directory, SessionMindOutputPaths.workflowRoot, "articles", "session-1.md"),
     );
 
-    const persistedBundle = JSON.parse(await readFile(result.promptBundlePath, "utf8")) as PromptBundle;
+    const persistedBundle = JSON.parse(
+      await readFile(result.promptBundlePath, "utf8"),
+    ) as PromptBundle;
     expect(persistedBundle.topicHint).toBe("Workflow session");
+    expect(result.promptBundlePath).toContain("session-1.prompt.json");
   });
 
   it("returns a protocol violation when the subprocess exits successfully without writing the artifact", async () => {
