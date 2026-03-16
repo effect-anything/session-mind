@@ -5,10 +5,11 @@ import { SessionMindOutputPaths } from "../domain/SubprocessProtocol";
 import {
   ExtractionError,
   PromptGenerationError,
+  ValidationError,
 } from "../domain/SessionMindErrors";
 import type { SessionMindError } from "../domain/SessionMindErrors";
 import { PromptComposer } from "./PromptComposer";
-import { ArtifactValidator } from "./ArtifactValidator";
+import { ArtifactValidator, type ArtifactValidationResult } from "./ArtifactValidator";
 import { SubprocessSpawner, type SpawnSubprocessResult } from "./SubprocessSpawner";
 import {
   WorkflowStateManager,
@@ -39,20 +40,14 @@ const workflowPathsFor = (workdir: string, sessionId: string) => {
   return {
     outputDir,
     stateFilePath: join(outputDir, SessionMindOutputPaths.stateFile),
-    artifactPath: join(
-      outputDir,
-      SessionMindOutputPaths.articlesDirectory,
-      `${sessionId}.md`,
-    ),
+    artifactPath: join(outputDir, SessionMindOutputPaths.articlesDirectory, `${sessionId}.md`),
   };
 };
 
 export class SessionMindWorkflow extends ServiceMap.Service<
   SessionMindWorkflow,
   {
-    run(
-      request: RunWorkflowRequest,
-    ): Effect.Effect<SessionMindWorkflowResult, SessionMindError>;
+    run(request: RunWorkflowRequest): Effect.Effect<SessionMindWorkflowResult, SessionMindError>;
   }
 >()("session-mind/SessionMindWorkflow") {
   static readonly layer = Layer.effect(SessionMindWorkflow)(
@@ -110,6 +105,51 @@ export class SessionMindWorkflow extends ServiceMap.Service<
         );
       };
 
+      const ensureArtifactIsValid = (
+        sessionId: string,
+        validation: ArtifactValidationResult,
+      ): Effect.Effect<ArtifactValidationResult, ValidationError> => {
+        if (validation.isValid) {
+          return Effect.succeed(validation);
+        }
+
+        const primaryIssue = validation.issues[0];
+        const code =
+          primaryIssue?.code === "file-not-found"
+            ? "ARTIFACT_NOT_FOUND"
+            : primaryIssue?.code === "empty-content"
+              ? "ARTIFACT_EMPTY"
+              : primaryIssue?.code === "content-too-short"
+                ? "ARTIFACT_TOO_SHORT"
+                : primaryIssue?.code === "invalid-markdown"
+                  ? "ARTIFACT_INVALID_FORMAT"
+                  : "ARTIFACT_CHECK_FAILED";
+
+        return Effect.fail(
+          new ValidationError({
+            code,
+            message: primaryIssue?.message ?? "Generated artifact failed validation",
+            context: {
+              artifactPath: validation.artifactPath,
+              sessionId,
+              ...(primaryIssue !== undefined ? { rule: primaryIssue.code } : {}),
+              ...(primaryIssue?.actualLength !== undefined
+                ? { actualLength: primaryIssue.actualLength }
+                : { actualLength: validation.contentLength }),
+              ...(primaryIssue?.expectedMinimumLength !== undefined
+                ? { minimumLength: primaryIssue.expectedMinimumLength }
+                : {}),
+              details: {
+                issues: validation.issues.map((issue) => ({
+                  code: issue.code,
+                  message: issue.message,
+                })),
+              },
+            },
+          }),
+        );
+      };
+
       const run = Effect.fn("SessionMindWorkflow.run")(function* ({
         sessionId,
         command,
@@ -162,99 +202,102 @@ export class SessionMindWorkflow extends ServiceMap.Service<
 
         const workflowEffect: Effect.Effect<SessionMindWorkflowResult, SessionMindError> =
           Effect.gen(function* () {
-          if (recoveredState?.stage === "failed") {
+            if (recoveredState?.stage === "failed") {
+              yield* stateManager.transition({
+                stateFilePath: paths.stateFilePath,
+                sessionId,
+                nextStage: activeStage,
+                artifactPath: recoveredState.artifactPath,
+                ...(recoveredState.promptBundlePath !== undefined
+                  ? { promptBundlePath: recoveredState.promptBundlePath }
+                  : {}),
+              });
+            }
+
+            const extracted = yield* extractConversation(sessionId);
+            if (activeStage === "extracting") {
+              yield* stateManager.transition({
+                stateFilePath: paths.stateFilePath,
+                sessionId,
+                nextStage: "generating",
+                artifactPath: paths.artifactPath,
+              });
+            }
+
+            const promptBundle = yield* composePrompt(extracted);
+            let subprocess: SpawnSubprocessResult;
+
+            if (activeStage === "extracting" || activeStage === "generating") {
+              yield* stateManager.transition({
+                stateFilePath: paths.stateFilePath,
+                sessionId,
+                nextStage: "executing",
+                artifactPath: paths.artifactPath,
+              });
+            }
+
+            if (activeStage === "validating") {
+              subprocess = {
+                sessionId,
+                artifactPath: recoveredState?.artifactPath ?? paths.artifactPath,
+                promptBundlePath: recoveredState?.promptBundlePath ?? "",
+                exitCode: 0,
+                stdout: "",
+                stderr: "",
+              };
+            } else {
+              subprocess = yield* spawner.spawn({
+                command,
+                args,
+                cwd,
+                sessionId,
+                promptBundle,
+                outputDir: paths.outputDir,
+                ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+              });
+              yield* stateManager.transition({
+                stateFilePath: paths.stateFilePath,
+                sessionId,
+                nextStage: "validating",
+                artifactPath: subprocess.artifactPath,
+                promptBundlePath: subprocess.promptBundlePath,
+              });
+            }
+
+            const validation = yield* validator.validate(
+              subprocess.artifactPath,
+              minimumArtifactLength !== undefined
+                ? { minimumLength: minimumArtifactLength }
+                : undefined,
+            );
+            yield* ensureArtifactIsValid(sessionId, validation);
+
             yield* stateManager.transition({
               stateFilePath: paths.stateFilePath,
               sessionId,
-              nextStage: activeStage,
-              artifactPath: recoveredState.artifactPath,
-              ...(recoveredState.promptBundlePath !== undefined
-                ? { promptBundlePath: recoveredState.promptBundlePath }
-                : {}),
-            });
-          }
-
-          const extracted = yield* extractConversation(sessionId);
-          if (activeStage === "extracting") {
-            yield* stateManager.transition({
-              stateFilePath: paths.stateFilePath,
-              sessionId,
-              nextStage: "generating",
-              artifactPath: paths.artifactPath,
-            });
-          }
-
-          const promptBundle = yield* composePrompt(extracted);
-          let subprocess: SpawnSubprocessResult;
-
-          if (activeStage === "extracting" || activeStage === "generating") {
-            yield* stateManager.transition({
-              stateFilePath: paths.stateFilePath,
-              sessionId,
-              nextStage: "executing",
-              artifactPath: paths.artifactPath,
-            });
-          }
-
-          if (activeStage === "validating") {
-            subprocess = {
-              sessionId,
-              artifactPath: recoveredState?.artifactPath ?? paths.artifactPath,
-              promptBundlePath: recoveredState?.promptBundlePath ?? "",
-              exitCode: 0,
-              stdout: "",
-              stderr: "",
-            };
-          } else {
-            subprocess = yield* spawner.spawn({
-              command,
-              args,
-              cwd,
-              sessionId,
-              promptBundle,
-              outputDir: paths.outputDir,
-              ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-            });
-            yield* stateManager.transition({
-              stateFilePath: paths.stateFilePath,
-              sessionId,
-              nextStage: "validating",
+              nextStage: "complete",
               artifactPath: subprocess.artifactPath,
               promptBundlePath: subprocess.promptBundlePath,
             });
-          }
 
-          yield* validator.validate(
-            subprocess.artifactPath,
-            minimumArtifactLength !== undefined
-              ? { minimumLength: minimumArtifactLength }
-              : undefined,
-          );
-
-          yield* stateManager.transition({
-            stateFilePath: paths.stateFilePath,
-            sessionId,
-            nextStage: "complete",
-            artifactPath: subprocess.artifactPath,
-            promptBundlePath: subprocess.promptBundlePath,
-          });
-
-          return {
-            sessionId,
-            artifactPath: subprocess.artifactPath,
-            promptBundle,
-            subprocess,
-          } satisfies SessionMindWorkflowResult;
+            return {
+              sessionId,
+              artifactPath: subprocess.artifactPath,
+              promptBundle,
+              subprocess,
+            } satisfies SessionMindWorkflowResult;
           });
 
         return yield* Effect.catch(
           workflowEffect,
           (cause: SessionMindError): Effect.Effect<never, SessionMindError> =>
-            stateManager.markFailure({
-              stateFilePath: paths.stateFilePath,
-              sessionId,
-              message: cause.message,
-            }).pipe(Effect.flatMap(() => Effect.fail(cause))),
+            stateManager
+              .markFailure({
+                stateFilePath: paths.stateFilePath,
+                sessionId,
+                message: cause.message,
+              })
+              .pipe(Effect.flatMap(() => Effect.fail(cause))),
         );
       });
 

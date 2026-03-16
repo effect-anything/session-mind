@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { Effect, Layer, Option, Schema, ServiceMap } from "effect";
+import { Effect, Layer, Option, Schema, Semaphore, ServiceMap } from "effect";
 import { StateError } from "../domain/SessionMindErrors";
 
 export const WorkflowStageSchema = Schema.Literals([
@@ -180,9 +180,11 @@ export class WorkflowStateManager extends ServiceMap.Service<
     ): Effect.Effect<WorkflowRecovery, StateError>;
   }
 >()("session-mind/WorkflowStateManager") {
-  static readonly layer = Layer.succeed(
-    WorkflowStateManager,
-    (() => {
+  static readonly layer = Layer.effect(WorkflowStateManager)(
+    Effect.gen(function* () {
+      const stateLock = yield* Semaphore.make(1);
+      const withStateLock = stateLock.withPermits(1);
+
       const readState = Effect.fn("WorkflowStateManager.readState")(function* (
         stateFilePath: string,
       ) {
@@ -209,31 +211,35 @@ export class WorkflowStateManager extends ServiceMap.Service<
         sessionId,
         artifactPath,
       }: InitializeSessionRequest) {
-        const state = yield* readState(stateFilePath);
-        const existing = state.sessions[sessionId];
-        if (existing) {
-          return existing;
-        }
+        return yield* withStateLock(
+          Effect.gen(function* () {
+            const state = yield* readState(stateFilePath);
+            const existing = state.sessions[sessionId];
+            if (existing) {
+              return existing;
+            }
 
-        const sessionState: SessionWorkflowState = {
-          sessionId,
-          stage: "extracting",
-          artifactPath,
-          updatedAt: Date.now(),
-          retryCount: 0,
-          lastStableStage: "extracting",
-        };
+            const sessionState: SessionWorkflowState = {
+              sessionId,
+              stage: "extracting",
+              artifactPath,
+              updatedAt: Date.now(),
+              retryCount: 0,
+              lastStableStage: "extracting",
+            };
 
-        const nextState: WorkflowState = {
-          ...state,
-          sessions: {
-            ...state.sessions,
-            [sessionId]: sessionState,
-          },
-        };
+            const nextState: WorkflowState = {
+              ...state,
+              sessions: {
+                ...state.sessions,
+                [sessionId]: sessionState,
+              },
+            };
 
-        yield* persistStateFile(stateFilePath, nextState);
-        return sessionState;
+            yield* persistStateFile(stateFilePath, nextState);
+            return sessionState;
+          }),
+        );
       });
 
       const transition = Effect.fn("WorkflowStateManager.transition")(function* ({
@@ -243,63 +249,67 @@ export class WorkflowStateManager extends ServiceMap.Service<
         artifactPath,
         promptBundlePath,
       }: TransitionWorkflowRequest) {
-        const state = yield* readState(stateFilePath);
-        const current = state.sessions[sessionId];
+        return yield* withStateLock(
+          Effect.gen(function* () {
+            const state = yield* readState(stateFilePath);
+            const current = state.sessions[sessionId];
 
-        if (!current) {
-          return yield* new StateError({
-            code: "STATE_TRANSITION_INVALID",
-            message: "Cannot transition a session without state",
-            context: {
-              stateFilePath,
-              sessionId,
-              nextState: nextStage,
-            },
-          });
-        }
+            if (!current) {
+              return yield* new StateError({
+                code: "STATE_TRANSITION_INVALID",
+                message: "Cannot transition a session without state",
+                context: {
+                  stateFilePath,
+                  sessionId,
+                  nextState: nextStage,
+                },
+              });
+            }
 
-        if (!allowedTransitions[current.stage].includes(nextStage)) {
-          return yield* new StateError({
-            code: "STATE_TRANSITION_INVALID",
-            message: "Invalid workflow state transition",
-            context: {
-              stateFilePath,
-              sessionId,
-              currentState: current.stage,
-              nextState: nextStage,
-              retryCount: current.retryCount,
-            },
-          });
-        }
+            if (!allowedTransitions[current.stage].includes(nextStage)) {
+              return yield* new StateError({
+                code: "STATE_TRANSITION_INVALID",
+                message: "Invalid workflow state transition",
+                context: {
+                  stateFilePath,
+                  sessionId,
+                  currentState: current.stage,
+                  nextState: nextStage,
+                  retryCount: current.retryCount,
+                },
+              });
+            }
 
-        const { lastError: _lastError, ...currentWithoutLastError } = current;
-        const nextSessionState: SessionWorkflowState = {
-          ...currentWithoutLastError,
-          stage: nextStage,
-          artifactPath: artifactPath ?? current.artifactPath,
-          updatedAt: Date.now(),
-          ...(isActiveStage(nextStage)
-            ? { lastStableStage: nextStage }
-            : current.lastStableStage !== undefined
-              ? { lastStableStage: current.lastStableStage }
-              : {}),
-          ...(promptBundlePath !== undefined
-            ? { promptBundlePath }
-            : current.promptBundlePath !== undefined
-              ? { promptBundlePath: current.promptBundlePath }
-              : {}),
-        };
+            const { lastError: _lastError, ...currentWithoutLastError } = current;
+            const nextSessionState: SessionWorkflowState = {
+              ...currentWithoutLastError,
+              stage: nextStage,
+              artifactPath: artifactPath ?? current.artifactPath,
+              updatedAt: Date.now(),
+              ...(isActiveStage(nextStage)
+                ? { lastStableStage: nextStage }
+                : current.lastStableStage !== undefined
+                  ? { lastStableStage: current.lastStableStage }
+                  : {}),
+              ...(promptBundlePath !== undefined
+                ? { promptBundlePath }
+                : current.promptBundlePath !== undefined
+                  ? { promptBundlePath: current.promptBundlePath }
+                  : {}),
+            };
 
-        const nextStateObject: WorkflowState = {
-          ...state,
-          sessions: {
-            ...state.sessions,
-            [sessionId]: nextSessionState,
-          },
-        };
+            const nextStateObject: WorkflowState = {
+              ...state,
+              sessions: {
+                ...state.sessions,
+                [sessionId]: nextSessionState,
+              },
+            };
 
-        yield* persistStateFile(stateFilePath, nextStateObject);
-        return nextSessionState;
+            yield* persistStateFile(stateFilePath, nextStateObject);
+            return nextSessionState;
+          }),
+        );
       });
 
       const markFailure = Effect.fn("WorkflowStateManager.markFailure")(function* ({
@@ -307,39 +317,43 @@ export class WorkflowStateManager extends ServiceMap.Service<
         sessionId,
         message,
       }: MarkWorkflowFailureRequest) {
-        const state = yield* readState(stateFilePath);
-        const current = state.sessions[sessionId];
+        return yield* withStateLock(
+          Effect.gen(function* () {
+            const state = yield* readState(stateFilePath);
+            const current = state.sessions[sessionId];
 
-        if (!current) {
-          return yield* new StateError({
-            code: "STATE_TRANSITION_INVALID",
-            message: "Cannot fail a session without state",
-            context: {
-              stateFilePath,
-              sessionId,
-              nextState: "failed",
-            },
-          });
-        }
+            if (!current) {
+              return yield* new StateError({
+                code: "STATE_TRANSITION_INVALID",
+                message: "Cannot fail a session without state",
+                context: {
+                  stateFilePath,
+                  sessionId,
+                  nextState: "failed",
+                },
+              });
+            }
 
-        const failedState: SessionWorkflowState = {
-          ...current,
-          stage: "failed",
-          updatedAt: Date.now(),
-          retryCount: current.retryCount + 1,
-          lastError: message,
-        };
+            const failedState: SessionWorkflowState = {
+              ...current,
+              stage: "failed",
+              updatedAt: Date.now(),
+              retryCount: current.retryCount + 1,
+              lastError: message,
+            };
 
-        const nextState: WorkflowState = {
-          ...state,
-          sessions: {
-            ...state.sessions,
-            [sessionId]: failedState,
-          },
-        };
+            const nextState: WorkflowState = {
+              ...state,
+              sessions: {
+                ...state.sessions,
+                [sessionId]: failedState,
+              },
+            };
 
-        yield* persistStateFile(stateFilePath, nextState);
-        return failedState;
+            yield* persistStateFile(stateFilePath, nextState);
+            return failedState;
+          }),
+        );
       });
 
       const recoverSession = Effect.fn("WorkflowStateManager.recoverSession")(function* (
@@ -396,6 +410,6 @@ export class WorkflowStateManager extends ServiceMap.Service<
         markFailure,
         recoverSession,
       });
-    })(),
+    }),
   );
 }
