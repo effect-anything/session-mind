@@ -5,8 +5,8 @@ import { Effect } from "effect";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ExtractedConversation, PromptBundle } from "../src/domain/Session";
 import {
-  SessionMindEnvironmentVariables,
   SessionMindOutputPaths,
+  SubprocessEnvironmentVariable,
 } from "../src/domain/SubprocessProtocol";
 import { SubprocessSpawner } from "../src/services/SubprocessSpawner";
 
@@ -82,13 +82,16 @@ describe("SubprocessSpawner", () => {
     const script = [
       "const fs = require('node:fs');",
       "const path = require('node:path');",
-      `const bundle = JSON.parse(process.env.${SessionMindEnvironmentVariables.promptBundle});`,
-      `const outputDir = process.env.${SessionMindEnvironmentVariables.outputDir};`,
-      `const sessionId = process.env.${SessionMindEnvironmentVariables.sessionId};`,
+      `const bundle = JSON.parse(process.env.${SubprocessEnvironmentVariable.promptBundle});`,
+      `const outputDir = process.env.${SubprocessEnvironmentVariable.outputDir};`,
+      `const sessionId = process.env.${SubprocessEnvironmentVariable.sessionId};`,
+      "const bundlePath = path.join(outputDir, 'bundles', `${sessionId}.prompt.json`);",
+      "const persistedBundle = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));",
       "const artifactPath = path.join(outputDir, 'articles', `${sessionId}.md`);",
       "fs.mkdirSync(path.dirname(artifactPath), { recursive: true });",
+      "if (persistedBundle.topicHint !== bundle.topicHint) { process.exit(5); }",
       "fs.writeFileSync(artifactPath, `# ${bundle.topicHint}\\n\\nThis generated article content is intentionally long enough to pass validation.`);",
-      "process.stdout.write(`${sessionId}:${bundle.sourceSessionIds.join(',')}`);",
+      "process.stdout.write(`${sessionId}:${persistedBundle.sourceSessionIds.join(',')}`);",
     ].join("");
 
     const result = await spawnSubprocess(directory, ["-e", script], 1_000);
@@ -101,6 +104,21 @@ describe("SubprocessSpawner", () => {
 
     const persistedBundle = JSON.parse(await readFile(result.promptBundlePath, "utf8")) as PromptBundle;
     expect(persistedBundle.topicHint).toBe("Workflow session");
+  });
+
+  it("returns a protocol violation when the subprocess exits successfully without writing the artifact", async () => {
+    const directory = await createTempDirectory();
+    const script = "process.stdout.write('no artifact');";
+
+    await expect(spawnSubprocess(directory, ["-e", script], 1_000)).rejects.toMatchObject({
+      _tag: "SubprocessError",
+      code: "SUBPROCESS_PROTOCOL_VIOLATION",
+      context: expect.objectContaining({
+        details: expect.objectContaining({
+          stdout: "no artifact",
+        }),
+      }),
+    });
   });
 
   it("returns a typed error when the subprocess exits non-zero", async () => {
