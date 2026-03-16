@@ -8,16 +8,17 @@ import {
   Layer,
   Ref,
   Schema,
-  SchemaGetter,
   ServiceMap,
   Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { PromptBundleSchema, type PromptBundle } from "../domain/Session";
+import type { PromptBundle } from "../domain/Session";
 import {
   SessionMindOutputPaths,
   SubprocessEnvironmentVariable,
   SubprocessExitCode,
+  SubprocessPromptBundleJsonSchema,
+  SubprocessPromptBundlePrettyJsonSchema,
 } from "../domain/SubprocessProtocol";
 import { SubprocessError } from "../domain/SessionMindErrors";
 
@@ -43,18 +44,6 @@ export type SpawnSubprocessResult = {
 
 const defaultTimeoutMs = 30 * 60 * 1000;
 const killGracePeriod = Duration.seconds(1);
-const makeJsonStringSchema = <S extends Schema.Top>(schema: S, space?: number) =>
-  Schema.String.pipe(
-    Schema.decodeTo(schema, {
-      decode: SchemaGetter.parseJson(),
-      encode:
-        space === undefined ? SchemaGetter.stringifyJson() : SchemaGetter.stringifyJson({ space }),
-    }),
-  );
-const compactPromptBundleJsonSchema = makeJsonStringSchema(PromptBundleSchema);
-const persistedPromptBundleJsonSchema = makeJsonStringSchema(PromptBundleSchema, 2);
-const encodeCompactPromptBundleJson = Schema.encodeEffect(compactPromptBundleJsonSchema);
-const encodePersistedPromptBundleJson = Schema.encodeEffect(persistedPromptBundleJsonSchema);
 
 const isSubprocessError = (cause: unknown): cause is SubprocessError =>
   cause instanceof SubprocessError ||
@@ -108,6 +97,45 @@ const withCapturedOutput = (
   });
 };
 
+const encodePromptBundle = ({
+  command,
+  args,
+  cwd,
+  sessionId,
+  promptBundle,
+  outputDir,
+  timeoutMs,
+  promptBundlePath,
+}: Omit<SpawnSubprocessRequest, "timeoutMs"> & {
+  readonly timeoutMs: number;
+  readonly promptBundlePath: string;
+}) =>
+  Effect.all({
+    envValue: Schema.encodeEffect(SubprocessPromptBundleJsonSchema)(promptBundle),
+    persistedValue: Schema.encodeEffect(SubprocessPromptBundlePrettyJsonSchema)(promptBundle),
+  }).pipe(
+    Effect.mapError(
+      (cause) =>
+        new SubprocessError({
+          code: "SUBPROCESS_PROTOCOL_VIOLATION",
+          message: "Failed to encode the prompt bundle for subprocess transport",
+          context: buildContext({
+            command,
+            args,
+            cwd,
+            sessionId,
+            promptBundle,
+            outputDir,
+            timeoutMs,
+            details: {
+              cause: String(cause),
+              promptBundlePath,
+            },
+          }),
+        }),
+    ),
+  );
+
 export class SubprocessSpawner extends ServiceMap.Service<
   SubprocessSpawner,
   {
@@ -148,35 +176,10 @@ export class SubprocessSpawner extends ServiceMap.Service<
           timeoutMs,
           ...(env !== undefined ? { env } : {}),
         } satisfies SpawnSubprocessRequest;
-        const serializedPromptBundle = yield* encodeCompactPromptBundleJson(promptBundle).pipe(
-          Effect.mapError(
-            (cause) =>
-              new SubprocessError({
-                code: "SUBPROCESS_PROTOCOL_VIOLATION",
-                message: "Failed to encode the prompt bundle for subprocess environment variables",
-                context: buildContext({
-                  ...request,
-                  details: { cause: String(cause) },
-                }),
-              }),
-          ),
-        );
-        const persistedPromptBundle = yield* encodePersistedPromptBundleJson(promptBundle).pipe(
-          Effect.mapError(
-            (cause) =>
-              new SubprocessError({
-                code: "SUBPROCESS_PROTOCOL_VIOLATION",
-                message: "Failed to encode the prompt bundle for subprocess persistence",
-                context: buildContext({
-                  ...request,
-                  details: {
-                    cause: String(cause),
-                    promptBundlePath,
-                  },
-                }),
-              }),
-          ),
-        );
+        const serializedPromptBundle = yield* encodePromptBundle({
+          ...request,
+          promptBundlePath,
+        });
 
         yield* Effect.all([
           fs.makeDirectory(articlesDir, { recursive: true }),
@@ -195,7 +198,7 @@ export class SubprocessSpawner extends ServiceMap.Service<
           ),
         );
 
-        yield* fs.writeFileString(promptBundlePath, persistedPromptBundle).pipe(
+        yield* fs.writeFileString(promptBundlePath, serializedPromptBundle.persistedValue).pipe(
           Effect.mapError(
             (cause) =>
               new SubprocessError({
@@ -220,7 +223,7 @@ export class SubprocessSpawner extends ServiceMap.Service<
                   cwd,
                   env: {
                     ...env,
-                    [SubprocessEnvironmentVariable.promptBundle]: serializedPromptBundle,
+                    [SubprocessEnvironmentVariable.promptBundle]: serializedPromptBundle.envValue,
                     [SubprocessEnvironmentVariable.outputDir]: outputDir,
                     [SubprocessEnvironmentVariable.sessionId]: sessionId,
                     [SubprocessEnvironmentVariable.timeoutSeconds]: String(

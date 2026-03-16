@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import * as SchemaGetter from "effect/SchemaGetter";
 import { PromptBundleSchema, type PromptBundle } from "./Session";
 
 export const SubprocessEnvironmentVariable = {
@@ -89,6 +90,15 @@ export const SubprocessExitCodeDefinitions = [
  * The prompt bundle file should decode with the existing session domain schema.
  */
 export const SubprocessPromptBundleSchema = PromptBundleSchema;
+
+export const SubprocessPromptBundleJsonSchema = Schema.fromJsonString(SubprocessPromptBundleSchema);
+
+export const SubprocessPromptBundlePrettyJsonSchema = SubprocessPromptBundleJsonSchema.pipe(
+  Schema.encode({
+    decode: SchemaGetter.passthrough(),
+    encode: SchemaGetter.parseJson({}).compose(SchemaGetter.stringifyJson({ space: 2 })),
+  }),
+);
 
 export type SubprocessPromptBundle = PromptBundle;
 
@@ -191,8 +201,7 @@ export const SessionMindExitCodes = {
   error: 3,
 } as const;
 
-export type SessionMindExitCode =
-  (typeof SessionMindExitCodes)[keyof typeof SessionMindExitCodes];
+export type SessionMindExitCode = (typeof SessionMindExitCodes)[keyof typeof SessionMindExitCodes];
 
 export const SessionMindOutputPaths = {
   workflowRoot: ".output/session-mind",

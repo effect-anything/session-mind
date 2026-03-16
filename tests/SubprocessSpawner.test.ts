@@ -89,21 +89,34 @@ describe("SubprocessSpawner", () => {
       `const outputDir = process.env.${SubprocessEnvironmentVariable.outputDir};`,
       `const sessionId = process.env.${SubprocessEnvironmentVariable.sessionId};`,
       "const bundlePath = path.join(outputDir, 'bundles', `${sessionId}.prompt.json`);",
-      "const persistedBundleText = fs.readFileSync(bundlePath, 'utf8');",
-      "const persistedBundle = JSON.parse(persistedBundleText);",
+      "const persistedBundleRaw = fs.readFileSync(bundlePath, 'utf8');",
+      "const persistedBundleText = persistedBundleRaw;",
+      `const envBundleRaw = process.env.${SubprocessEnvironmentVariable.promptBundle};`,
+      "const persistedBundle = JSON.parse(persistedBundleRaw);",
       "const artifactPath = path.join(outputDir, 'articles', `${sessionId}.md`);",
       "fs.mkdirSync(path.dirname(artifactPath), { recursive: true });",
       "if (compactBundleText !== JSON.stringify(bundle)) { process.exit(6); }",
       "if (persistedBundleText !== JSON.stringify(bundle, null, 2)) { process.exit(7); }",
       "if (persistedBundle.topicHint !== bundle.topicHint) { process.exit(5); }",
       "fs.writeFileSync(artifactPath, `# ${bundle.topicHint}\\n\\nThis generated article content is intentionally long enough to pass validation.`);",
-      "process.stdout.write(`${sessionId}:${persistedBundle.sourceSessionIds.join(',')}`);",
+      "process.stdout.write(JSON.stringify({ sessionId, envBundleRaw, persistedBundleRaw, sourceSessionIds: persistedBundle.sourceSessionIds }));",
     ].join("");
 
     const result = await spawnSubprocess(directory, ["-e", script], 1_000);
+    const stdoutPayload = JSON.parse(result.stdout) as {
+      sessionId: string;
+      envBundleRaw: string;
+      persistedBundleRaw: string;
+      sourceSessionIds: ReadonlyArray<string>;
+    };
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("session-1:session-1");
+    expect(stdoutPayload).toEqual({
+      sessionId: "session-1",
+      envBundleRaw: JSON.stringify(promptBundle),
+      persistedBundleRaw: JSON.stringify(promptBundle, null, 2),
+      sourceSessionIds: ["session-1"],
+    });
     expect(result.artifactPath).toBe(
       join(directory, SessionMindOutputPaths.workflowRoot, "articles", "session-1.md"),
     );
