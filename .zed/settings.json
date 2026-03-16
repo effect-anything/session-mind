@@ -1,0 +1,138 @@
+{
+  "load_direnv": "shell_hook",
+  "formatter": "auto",
+  "languages": {
+    "JSON": {
+      "language_servers": ["oxlint", "oxfmt", "cspell", "json-language-server"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "oxfmt"
+          }
+        },
+        {
+          "code_action": "source.fixAll.oxc"
+        }
+      ]
+    },
+    "JSONC": {
+      "language_servers": ["oxlint", "oxfmt", "cspell", "json-language-server"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "oxfmt"
+          }
+        },
+        {
+          "code_action": "source.fixAll.oxc"
+        }
+      ]
+    },
+    "JavaScript": {
+      "language_servers": ["vtsls", "oxlint", "oxfmt", "cspell"],
+
+      "formatter": [
+        {
+          "language_server": {
+            "name": "oxfmt"
+          }
+        },
+        {
+          "code_action": "source.fixAll.oxc"
+        }
+      ]
+    },
+    "TypeScript": {
+      "language_servers": ["vtsls", "oxlint", "oxfmt", "cspell"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "oxfmt"
+          }
+        },
+        {
+          "code_action": "source.fixAll.oxc"
+        }
+      ]
+    },
+    "TSX": {
+      "language_servers": ["vtsls", "oxlint", "oxfmt", "cspell"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "oxfmt"
+          }
+        },
+        {
+          "code_action": "source.fixAll.oxc"
+        }
+      ]
+    }
+  },
+  "lsp": {
+    "oxlint": {
+      "initialization_options": {
+        "settings": {
+          "disableNestedConfig": false,
+          "fixKind": "safe_fix",
+          "run": "onType",
+          "typeAware": false,
+          "unusedDisableDirectives": "deny"
+        }
+      }
+    },
+    "oxfmt": {
+      "initialization_options": {
+        "settings": {
+          // "configPath": null,
+          "flags": {},
+          // "fmt.configPath": null,
+          "fmt.experimental": true,
+          "run": "onSave",
+          "typeAware": false,
+          "unusedDisableDirectives": false
+        }
+      }
+    },
+    "vtsls": {
+      "settings": {
+        "tsserver": {
+          "maxTsServerMemory": 8092,
+          "enableRegionDiagnostics": true
+        },
+        "experimental": {
+          "completion": {
+            "entriesLimit": 10,
+            "enableServerSideFuzzyMatch": true
+          }
+        },
+        "autoUseWorkspaceTsdk": true,
+        "typescript": {
+          "tsserver": { "maxTsServerMemory": 8092, "enableRegionDiagnostics": true },
+          "workspaceSymbols": { "scope": "currentProject" },
+          "preferGoToSourceDefinition": true,
+          "preferences": {
+            "importModuleSpecifier": "non-relative",
+            "autoImportSpecifierExcludeRegexes": ["^node:.*$", "effect/.*", "@effect/.*"]
+          }
+        }
+      }
+    },
+    "tailwindcss-language-server": {
+      "settings": {
+        "tailwindCSS": {
+          "emmetCompletions": true
+        }
+      }
+    }
+  },
+  "file_scan_exclusions": [
+    ".direnv",
+    ".envrc",
+    "**/build",
+    "**/dist",
+    "**/.wrangler",
+    "**/*.tsbuildinfo",
+    ".DS_Store"
+  ]
+}
