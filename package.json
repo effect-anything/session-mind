@@ -58,11 +58,12 @@
   },
   "devDependencies": {
     "@changesets/cli": "^2.29.7",
-    "@effect/platform-node": "4.0.0-beta.40",
+    "@effect/platform-node": "4.0.0-beta.41",
     "@effect/tsgo": "0.0.20",
-    "@effect/vitest": "0.29.0",
-    "@vitest/coverage-v8": "^4.1.2",
-    "effect": "4.0.0-beta.40",
+    "@effect/vitest": "4.0.0-beta.41",
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "7.0.0-dev.20260327.2",
+    "effect": "4.0.0-beta.41",
     "lefthook": "^2.1.4",
     "oxfmt": "^0.42.0",
     "oxlint": "^1.57.0",
@@ -74,9 +75,9 @@
     "node": ">=24"
   },
   "inlinedDependencies": {
-    "@effect/platform-node": "4.0.0-beta.40",
+    "@effect/platform-node": "4.0.0-beta.41",
     "@effect/platform-node-shared": "4.0.0-beta.41",
-    "effect": "4.0.0-beta.40",
+    "effect": "4.0.0-beta.41",
     "ini": "6.0.0",
     "toml": "3.0.0",
     "yaml": "2.8.2"
